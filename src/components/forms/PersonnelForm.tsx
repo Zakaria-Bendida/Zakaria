@@ -91,6 +91,7 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
       prenom: formData.prenom,
       role: formData.role,
       telephone: formData.telephone,
+      phone: formData.telephone,
       email: formData.email,
     };
 
