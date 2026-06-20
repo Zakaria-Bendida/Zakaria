@@ -1,0 +1,138 @@
+@import 'fomantic-ui-css/semantic.min.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles for the emergency management platform */
+body {
+  font-family: 'Lato', 'Helvetica Neue', Arial, Helvetica, sans-serif;
+  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  min-height: 100vh;
+}
+
+.main-content {
+  min-height: calc(100vh - 80px);
+}
+
+/* Map container styles */
+.map-container {
+  height: 400px;
+  width: 100%;
+  border: 2px solid #2185d0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.map-full {
+  height: 70vh;
+}
+
+/* Dashboard cards */
+.dashboard-card {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+}
+
+.dashboard-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+}
+
+/* Status badges */
+.status-badge {
+  border-radius: 12px;
+  padding: 4px 12px;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+/* Emergency theme colors */
+.emergency-primary { background-color: #2185d0; }
+.emergency-success { background-color: #21ba45; }
+.emergency-warning { background-color: #f2711c; }
+.emergency-danger { background-color: #db2828; }
+
+/* Chart containers */
+.chart-container {
+  position: relative;
+  height: 300px;
+  background: white;
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* Table improvements */
+.ui.table {
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* Button groups */
+.action-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+  .ui.stackable.grid > .column {
+    margin-bottom: 1rem;
+  }
+  
+  .map-container {
+    height: 300px;
+  }
+  
+  .chart-container {
+    height: 250px;
+  }
+}
+
+/* Loading states */
+.loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255,255,255,0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+/* Print styles */
+@media print {
+  .ui.menu, .action-buttons, .ui.pagination.menu {
+    display: none !important;
+  }
+}
+
+/* Custom Tool Buttons for Map */
+.custom-tool-btn {
+    width: 32px !important;
+    height: 32px !important;
+    padding: 4px !important;
+    margin: 0 !important; /* Managed by gap in grid */
+    font-size: 14px !important;
+    border-radius: 6px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+.custom-tools-grid {
+    display: grid !important;
+    grid-template-columns: repeat(5, 32px) !important;
+    gap: 4px !important;
+    margin-top: 8px !important;
+    justify-content: flex-end !important;
+    align-items: flex-end !important;
+    position: relative !important;
+    right: 8px !important;
+}
