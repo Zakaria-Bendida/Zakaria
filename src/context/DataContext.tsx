@@ -7,7 +7,7 @@ import React, {
 } from "react";
 import { useAuth } from "./AuthContext";
 
-const API_BASE_URL = "http://192.168.1.5:5000/api";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
 
 const getAuthHeaders = () => {
   const token = localStorage.getItem("token");

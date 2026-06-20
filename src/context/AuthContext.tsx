@@ -23,7 +23,7 @@ interface AuthContextType {
   hasRole: (roles: string[]) => boolean;
 }
 
-const API_BASE_URL = "http://192.168.1.5:5000/api";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
