@@ -86,6 +86,7 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
     }
 
     const personnelData: any = {
+      fullName: `${formData.prenom} ${formData.nom}`.trim(),
       nom: formData.nom,
       prenom: formData.prenom,
       role: formData.role,
