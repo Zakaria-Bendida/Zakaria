@@ -37,8 +37,8 @@ import {
   Truck,
 } from "lucide-react";
 
-const API_BASE_URL = "http://192.168.1.5:5000/api";
-const SOCKET_URL = "http://192.168.1.5:5000";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || window.location.origin;
 
 const makeSVGIcon = (emoji: string, bg: string, size = 36) =>
   "data:image/svg+xml;charset=utf-8," +

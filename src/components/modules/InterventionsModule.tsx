@@ -29,8 +29,8 @@ import InterventionForm from "../forms/InterventionForm";
 import InterventionMapModal from "../modules/InterventionMapModal";
 import { io as socketIO } from "socket.io-client";
 
-const API_BASE_URL = "http://192.168.1.5:5000/api";
-const SOCKET_URL = "http://192.168.1.5:5000";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || window.location.origin;
 
 const InterventionsModule: React.FC = () => {
   const {
