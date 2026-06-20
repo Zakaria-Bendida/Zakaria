@@ -8,6 +8,7 @@
     "dev:server": "cd server && npm run dev",
     "dev:all": "concurrently \"npm run dev\" \"npm run dev:server\"",
     "build": "vite build",
+    "start": "node server/app.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },
