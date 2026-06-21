@@ -18,6 +18,7 @@ const getAuthHeaders = () => {
 };
 
 // Types
+// Types
 export interface Ambulance {
   id: number;
   immatriculation: string;
@@ -73,19 +74,19 @@ export interface Intervention {
 
 export interface Personnel {
   id: string;
-  _id?: string;
-  matricule?: string;
   nom: string;
   prenom: string;
-  role: string;
+  role: "manager" | "ambulancier";
+  phone: string; // ✅ Changé de telephone à phone
   email: string;
-  telephone: string;
-  fullName?: string;
   ambulanceId?: number;
+  matricule?: string;
+  isOnline?: boolean;
   isActive?: boolean;
+  lastOnline?: string;
+  currentInterventionId?: number;
   created_at?: string;
-  isOnline?: boolean; // ✅ ADD THIS
-  currentInterventionId?: number; // ✅ ADD THIS
+  fullName?: string;
 }
 
 interface DataContextType {
@@ -158,8 +159,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const mapPersonnel = (user: any): Personnel => ({
     id: user._id || user.id,
-    _id: user._id || user.id,
-    matricule: user.matricule,
+    matricule: user.matricule || null,
     nom:
       user.fullName?.split(" ").slice(1).join(" ") ||
       user.nom ||
@@ -167,15 +167,15 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({
       "",
     prenom: user.fullName?.split(" ")[0] || user.prenom || "",
     role: user.role || "user",
-    email: user.email,
-    telephone: user.phone || user.telephone || "",
-    fullName: user.fullName,
-    ambulanceId: user.ambulanceId,
-    isActive: user.isActive,
-    created_at: user.createdAt,
+    email: user.email || "",
+    phone: user.phone || user.telephone || "", // ✅ Supporte les deux
+    fullName: user.fullName || `${user.prenom || ""} ${user.nom || ""}`.trim(),
+    ambulanceId: user.ambulanceId || null,
+    isActive: user.isActive !== false,
+    created_at: user.createdAt || user.created_at,
     isOnline: user.isOnline === true,
-    lastOnline: user.lastOnline, // ← MAKE SURE THIS LINE EXISTS
-    currentInterventionId: user.currentInterventionId,
+    lastOnline: user.lastOnline || null,
+    currentInterventionId: user.currentInterventionId || null,
   });
 
   const loadAllData = useCallback(async () => {

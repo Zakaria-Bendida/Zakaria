@@ -3,35 +3,41 @@ import { User } from "../models/index.js";
 import bcrypt from "bcryptjs";
 import { pgPool } from "../config/database.js";
 
-// Get all users
-// Get all users
+// ── Helper: split fullName into nom/prenom for frontend ───────────────────
+const formatUser = (user) => ({
+  id: user._id,
+  _id: user._id,
+  fullName: user.fullName,
+  nom: user.fullName?.split(" ").slice(1).join(" ") || "",
+  prenom: user.fullName?.split(" ")[0] || "",
+  role: user.role,
+  email: user.email,
+  telephone: user.phone || "",
+  phone: user.phone,
+  ambulanceId: user.ambulanceId,
+  isActive: user.isActive,
+  isOnline: user.isOnline || false,
+  lastOnline: user.lastOnline || null,
+  currentInterventionId: user.currentInterventionId || null,
+  created_at: user.createdAt,
+});
+
+// ── Helper: resolve fullName from nom/prenom or fullName ──────────────────
+const resolveFullName = (body) => {
+  const { fullName, nom, prenom } = body;
+  if (fullName) return fullName;
+  if (nom && prenom) return `${prenom} ${nom}`;
+  return null;
+};
+
+// ── Get all users ─────────────────────────────────────────────────────────
 const getAllUsers = async (req, res) => {
   try {
     const users = await User.find({}).select("-passwordHash");
-
-    // Format users for frontend
-    const formattedUsers = users.map((user) => ({
-      id: user._id,
-      _id: user._id,
-      fullName: user.fullName,
-      nom: user.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: user.fullName?.split(" ")[0] || "",
-      role: user.role,
-      email: user.email,
-      telephone: user.phone || "",
-      phone: user.phone,
-      ambulanceId: user.ambulanceId,
-      matricule: user.matricule,
-      isActive: user.isActive,
-      isOnline: user.isOnline || false, // ✅ ADD THIS
-      currentInterventionId: user.currentInterventionId || null, // ✅ ADD THIS
-      created_at: user.createdAt,
-    }));
-
     res.json({
       success: true,
       count: users.length,
-      data: formattedUsers,
+      data: users.map(formatUser),
     });
   } catch (error) {
     console.error("Get all users error:", error);
@@ -39,50 +45,35 @@ const getAllUsers = async (req, res) => {
   }
 };
 
-// Get user by ID
+// ── Get user by ID ────────────────────────────────────────────────────────
 const getUserById = async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select("-passwordHash");
-
     if (!user) {
       return res.status(404).json({ success: false, error: "User not found" });
     }
-
-    const formattedUser = {
-      id: user._id,
-      _id: user._id,
-      fullName: user.fullName,
-      nom: user.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: user.fullName?.split(" ")[0] || "",
-      role: user.role,
-      email: user.email,
-      telephone: user.phone || "",
-      phone: user.phone,
-      ambulanceId: user.ambulanceId,
-      matricule: user.matricule,
-      isActive: user.isActive,
-      created_at: user.createdAt,
-    };
-
-    res.json({ success: true, data: formattedUser });
+    res.json({ success: true, data: formatUser(user) });
   } catch (error) {
     console.error("Get user error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
 
-// Create user by admin
+// ── Create user by admin ──────────────────────────────────────────────────
 const createUserByAdmin = async (req, res) => {
   try {
-    const { email, password, fullName, phone, role, ambulanceId, matricule } =
-      req.body;
+    const { email, password, phone, role, ambulanceId } = req.body;
 
-    console.log("📥 Create user:", { email, fullName, role, matricule });
+    // Resolve fullName from nom/prenom or fullName directly
+    const fullName = resolveFullName(req.body);
+
+    console.log("📥 Create user:", { email, fullName, role });
 
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({
         success: false,
-        error: "Email, password, fullName and role are required",
+        error:
+          "Email, password, fullName (or nom+prenom) and role are required",
       });
     }
 
@@ -108,26 +99,20 @@ const createUserByAdmin = async (req, res) => {
       passwordHash,
       fullName,
       phone: phone || "",
-      role: role,
+      role,
       ambulanceId: role === "ambulancier" ? ambulanceId || null : null,
-      matricule: matricule || "",
+      matricule: null,
       isActive: true,
     });
 
     await user.save();
 
+    console.log("✅ User created:", user._id, fullName, role);
+
     res.status(201).json({
       success: true,
       message: `User created successfully with role: ${role}`,
-      data: {
-        id: user._id,
-        _id: user._id,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-        ambulanceId: user.ambulanceId,
-        matricule: user.matricule,
-      },
+      data: formatUser(user),
     });
   } catch (error) {
     console.error("Create user error:", error);
@@ -135,48 +120,36 @@ const createUserByAdmin = async (req, res) => {
   }
 };
 
-// Update user - FIXED VERSION
+// ── Update user ───────────────────────────────────────────────────────────
 const updateUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { nom, prenom, role, telephone, email, ambulanceId, fullName } =
-      req.body;
+    const { role, telephone, email, ambulanceId } = req.body;
 
-    console.log("📥 UPDATE REQUEST:");
-    console.log("  - ID:", id);
-    console.log("  - nom:", nom);
-    console.log("  - prenom:", prenom);
-    console.log("  - role:", role);
-    console.log("  - telephone:", telephone);
-    console.log("  - email:", email);
-    console.log("  - ambulanceId:", ambulanceId);
+    console.log("📥 UPDATE REQUEST:", { id, ...req.body });
 
-    // Find the user first
     const existingUser = await User.findById(id);
     if (!existingUser) {
       return res.status(404).json({ success: false, error: "User not found" });
     }
 
-    // Build update data
     const updateData = {};
 
-    // Handle name - combine nom and prenom into fullName
-    if (nom && prenom) {
-      updateData.fullName = `${prenom} ${nom}`;
-    } else if (fullName) {
-      updateData.fullName = fullName;
-    }
+    // Resolve fullName from nom/prenom or fullName
+    const fullName = resolveFullName(req.body);
+    if (fullName) updateData.fullName = fullName;
 
     if (role) updateData.role = role;
     if (telephone) updateData.phone = telephone;
     if (email) updateData.email = email.toLowerCase();
+
     if (
       ambulanceId !== undefined &&
       ambulanceId !== null &&
       ambulanceId !== ""
     ) {
       updateData.ambulanceId = Number(ambulanceId);
-    } else if (role !== "ambulancier") {
+    } else if (role && role !== "ambulancier") {
       updateData.ambulanceId = null;
     }
 
@@ -184,7 +157,6 @@ const updateUser = async (req, res) => {
 
     console.log("📝 Update data being applied:", updateData);
 
-    // Update the user
     const updatedUser = await User.findByIdAndUpdate(id, updateData, {
       new: true,
       runValidators: true,
@@ -198,27 +170,10 @@ const updateUser = async (req, res) => {
 
     console.log("✅ User updated successfully:", updatedUser._id);
 
-    // Format response
-    const responseData = {
-      id: updatedUser._id,
-      _id: updatedUser._id,
-      fullName: updatedUser.fullName,
-      nom: updatedUser.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: updatedUser.fullName?.split(" ")[0] || "",
-      role: updatedUser.role,
-      email: updatedUser.email,
-      telephone: updatedUser.phone || "",
-      phone: updatedUser.phone,
-      ambulanceId: updatedUser.ambulanceId,
-      matricule: updatedUser.matricule,
-      isActive: updatedUser.isActive,
-      created_at: updatedUser.createdAt,
-    };
-
     res.json({
       success: true,
       message: "User updated successfully",
-      data: responseData,
+      data: formatUser(updatedUser),
     });
   } catch (error) {
     console.error("Update user error:", error);
@@ -226,14 +181,13 @@ const updateUser = async (req, res) => {
   }
 };
 
-// Delete user
+// ── Delete user ───────────────────────────────────────────────────────────
 const deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
     console.log("🗑️ Deleting user ID:", id);
 
     const user = await User.findByIdAndDelete(id);
-
     if (!user) {
       return res.status(404).json({ success: false, error: "User not found" });
     }
@@ -251,7 +205,7 @@ const deleteUser = async (req, res) => {
   }
 };
 
-// Get users by role
+// ── Get users by role ─────────────────────────────────────────────────────
 const getUsersByRole = async (req, res) => {
   try {
     const { role } = req.params;
@@ -264,25 +218,13 @@ const getUsersByRole = async (req, res) => {
       });
     }
 
-    const users = await User.find({ role: role }).select("-passwordHash");
-
-    const formattedUsers = users.map((user) => ({
-      id: user._id,
-      _id: user._id,
-      fullName: user.fullName,
-      nom: user.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: user.fullName?.split(" ")[0] || "",
-      role: user.role,
-      email: user.email,
-      telephone: user.phone || "",
-      ambulanceId: user.ambulanceId,
-    }));
+    const users = await User.find({ role }).select("-passwordHash");
 
     res.json({
       success: true,
       count: users.length,
-      role: role,
-      data: formattedUsers,
+      role,
+      data: users.map(formatUser),
     });
   } catch (error) {
     console.error("Get users by role error:", error);
@@ -290,32 +232,17 @@ const getUsersByRole = async (req, res) => {
   }
 };
 
-// Get drivers (ambulanciers)
+// ── Get drivers (ambulanciers) ────────────────────────────────────────────
 const getDrivers = async (req, res) => {
   try {
     const drivers = await User.find({ role: "ambulancier" }).select(
       "-passwordHash",
     );
 
-    const formattedDrivers = drivers.map((driver) => ({
-      id: driver._id,
-      _id: driver._id,
-      fullName: driver.fullName,
-      nom: driver.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: driver.fullName?.split(" ")[0] || "",
-      role: driver.role,
-      email: driver.email,
-      telephone: driver.phone || "",
-      ambulanceId: driver.ambulanceId,
-      isOnline: driver.isOnline,
-      lastOnline: driver.lastOnline, // ← MAKE SURE THIS LINE EXISTS
-      currentInterventionId: driver.currentInterventionId,
-    }));
-
     res.json({
       success: true,
       count: drivers.length,
-      data: formattedDrivers,
+      data: drivers.map(formatUser),
     });
   } catch (error) {
     console.error("Get drivers error:", error);
@@ -323,7 +250,7 @@ const getDrivers = async (req, res) => {
   }
 };
 
-// Get available drivers
+// ── Get available drivers ─────────────────────────────────────────────────
 const getAvailableDrivers = async (req, res) => {
   try {
     const drivers = await User.find({ role: "ambulancier" }).select(
@@ -341,18 +268,10 @@ const getAvailableDrivers = async (req, res) => {
       availableAmbulanceIds.includes(driver.ambulanceId),
     );
 
-    const formattedDrivers = availableDrivers.map((driver) => ({
-      id: driver._id,
-      _id: driver._id,
-      fullName: driver.fullName,
-      role: driver.role,
-      ambulanceId: driver.ambulanceId,
-    }));
-
     res.json({
       success: true,
       count: availableDrivers.length,
-      data: formattedDrivers,
+      data: availableDrivers.map(formatUser),
     });
   } catch (error) {
     console.error("Get available drivers error:", error);
@@ -360,14 +279,27 @@ const getAvailableDrivers = async (req, res) => {
   }
 };
 
-// Add this method to your userController.js
+// ── Get online drivers ────────────────────────────────────────────────────
+const getOnlineDrivers = async (req, res) => {
+  try {
+    const drivers = await User.find({
+      role: "ambulancier",
+      isOnline: true,
+      isActive: true,
+    }).select("-passwordHash");
 
-// Get online drivers
-// Add these functions to your userController.js (before the exports)
+    res.json({
+      success: true,
+      count: drivers.length,
+      data: drivers.map(formatUser),
+    });
+  } catch (error) {
+    console.error("Get online drivers error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
 
-// Add this function to your userController.js
-
-// Update driver status (online/offline) - Admin endpoint
+// ── Update driver status ──────────────────────────────────────────────────
 const updateDriverStatus = async (req, res) => {
   try {
     const { id } = req.params;
@@ -405,43 +337,6 @@ const updateDriverStatus = async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 };
-
-// Get online drivers
-const getOnlineDrivers = async (req, res) => {
-  try {
-    const drivers = await User.find({
-      role: "ambulancier",
-      isOnline: true,
-      isActive: true,
-    }).select("-passwordHash");
-
-    const formattedDrivers = drivers.map((driver) => ({
-      id: driver._id,
-      _id: driver._id,
-      fullName: driver.fullName,
-      nom: driver.fullName?.split(" ").slice(1).join(" ") || "",
-      prenom: driver.fullName?.split(" ")[0] || "",
-      role: driver.role,
-      email: driver.email,
-      telephone: driver.phone || "",
-      ambulanceId: driver.ambulanceId,
-      isOnline: true,
-      lastOnline: driver.lastOnline,
-      currentInterventionId: driver.currentInterventionId,
-    }));
-
-    res.json({
-      success: true,
-      count: drivers.length,
-      data: formattedDrivers,
-    });
-  } catch (error) {
-    console.error("Get online drivers error:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-};
-
-// Update driver online status
 
 export {
   getAllUsers,

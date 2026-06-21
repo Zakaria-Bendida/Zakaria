@@ -16,13 +16,13 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
   const { ambulances } = useData();
   const [formData, setFormData] = useState({
     id: personnel?.id || "",
-    matricule: personnel?.matricule || "",
     nom: personnel?.nom || "",
     prenom: personnel?.prenom || "",
     role: personnel?.role || "ambulancier",
-    telephone: personnel?.telephone || "",
+    phone: personnel?.phone || "", // ✅ Changé telephone → phone
     email: personnel?.email || "",
     ambulanceId: personnel?.ambulanceId?.toString() || "",
+    password: "", // ✅ Ajout du mot de passe
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
   const isEditing = !!personnel;
@@ -34,7 +34,7 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
         nom: personnel.nom,
         prenom: personnel.prenom,
         role: personnel.role,
-        matricule: personnel.matricule,
+        phone: personnel.phone,
       });
     }
   }, [personnel]);
@@ -44,7 +44,6 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
   ) => {
     const { name, value } = e.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
-
     if (errors[name]) {
       setErrors((prev) => ({ ...prev, [name]: "" }));
     }
@@ -53,9 +52,6 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
   const validate = () => {
     const newErrors: Record<string, string> = {};
 
-    if (!isEditing && !formData.matricule.trim()) {
-      newErrors.matricule = "Le matricule est requis";
-    }
     if (!formData.nom.trim()) {
       newErrors.nom = "Le nom est requis";
     }
@@ -70,8 +66,21 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
     } else if (!/\S+@\S+\.\S+/.test(formData.email)) {
       newErrors.email = "Format d'email invalide";
     }
-    if (!formData.telephone.trim()) {
-      newErrors.telephone = "Le téléphone est requis";
+    if (!formData.phone.trim()) {
+      // ✅ Changé telephone → phone
+      newErrors.phone = "Le téléphone est requis";
+    }
+    if (!isEditing && !formData.password.trim()) {
+      newErrors.password =
+        "Le mot de passe est requis pour un nouvel utilisateur";
+    }
+    if (
+      !isEditing &&
+      formData.password.length > 0 &&
+      formData.password.length < 6
+    ) {
+      newErrors.password =
+        "Le mot de passe doit contenir au moins 6 caractères";
     }
 
     setErrors(newErrors);
@@ -86,80 +95,41 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
     }
 
     const personnelData: any = {
-      fullName: `${formData.prenom} ${formData.nom}`.trim(),
       nom: formData.nom,
       prenom: formData.prenom,
       role: formData.role,
-      telephone: formData.telephone,
-      phone: formData.telephone,
+      phone: formData.phone, // ✅ Changé telephone → phone
       email: formData.email,
+      matricule: null,
     };
 
-    // Only include matricule for new users
+    // ✅ Gestion du mot de passe
     if (!isEditing) {
-      personnelData.matricule = formData.matricule;
-      personnelData.password = "default123"; // Add a default password for new users
+      // Si un mot de passe est fourni, l'utiliser, sinon utiliser le défaut
+      personnelData.password = formData.password.trim() || "default123";
     }
 
-    // Only include ambulanceId for ambulancier role
     if (formData.role === "ambulancier" && formData.ambulanceId) {
       personnelData.ambulanceId = Number(formData.ambulanceId);
     }
 
-    // Include id when editing
     if (isEditing && formData.id) {
       personnelData.id = formData.id;
     }
 
-    console.log("📤 Saving personnel data:", personnelData);
+    console.log("📤 Saving personnel data:", {
+      ...personnelData,
+      password: "***hidden***",
+    });
     onSave(personnelData);
-  };
-  const getRoleLabel = (role: string) => {
-    switch (role) {
-      case "manager":
-        return "Administrateur";
-      case "ambulancier":
-        return "Chauffeur Ambulancier";
-      default:
-        return role;
-    }
   };
 
   return (
     <form className="ui form" onSubmit={handleSubmit}>
-      <div className="two fields">
-        <div className={`${!isEditing ? "required" : ""} field`}>
-          <label>Matricule</label>
-          <input
-            type="text"
-            name="matricule"
-            value={formData.matricule}
-            onChange={handleChange}
-            placeholder="Ex: DRV001"
-            readOnly={isEditing}
-            disabled={isEditing}
-            style={
-              isEditing
-                ? { backgroundColor: "#f5f5f5", cursor: "not-allowed" }
-                : {}
-            }
-            className={errors.matricule ? "error" : ""}
-          />
-          {isEditing && (
-            <div
-              className="ui tiny info message"
-              style={{ marginTop: "0.25rem", padding: "0.25rem 0.5rem" }}
-            >
-              <small>⚠️ Le matricule ne peut pas être modifié</small>
-            </div>
-          )}
-          {errors.matricule && (
-            <div className="ui pointing red basic label">
-              {errors.matricule}
-            </div>
-          )}
-        </div>
+      {/* Hidden matricule */}
+      <input type="hidden" name="matricule" value="" />
 
+      <div className="two fields">
         <div className="required field">
           <label>Rôle</label>
           <select
@@ -173,6 +143,21 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
           </select>
           {errors.role && (
             <div className="ui pointing red basic label">{errors.role}</div>
+          )}
+        </div>
+
+        <div className="required field">
+          <label>Email</label>
+          <input
+            type="email"
+            name="email"
+            value={formData.email}
+            onChange={handleChange}
+            placeholder="nom.prenom@urgence.dz"
+            className={errors.email ? "error" : ""}
+          />
+          {errors.email && (
+            <div className="ui pointing red basic label">{errors.email}</div>
           )}
         </div>
       </div>
@@ -214,31 +199,57 @@ const PersonnelForm: React.FC<PersonnelFormProps> = ({
           <label>Téléphone</label>
           <input
             type="tel"
-            name="telephone"
-            value={formData.telephone}
+            name="phone" // ✅ Changé telephone → phone
+            value={formData.phone}
             onChange={handleChange}
             placeholder="Ex: 0555123456"
-            className={errors.telephone ? "error" : ""}
+            className={errors.phone ? "error" : ""}
           />
-          {errors.telephone && (
-            <div className="ui pointing red basic label">
-              {errors.telephone}
-            </div>
+          {errors.phone && (
+            <div className="ui pointing red basic label">{errors.phone}</div>
           )}
         </div>
 
-        <div className="required field">
-          <label>Email</label>
+        <div className={`field ${!isEditing ? "required" : ""}`}>
+          <label>Mot de passe</label>
           <input
-            type="email"
-            name="email"
-            value={formData.email}
+            type="password"
+            name="password"
+            value={formData.password}
             onChange={handleChange}
-            placeholder="nom.prenom@urgence.dz"
-            className={errors.email ? "error" : ""}
+            placeholder={
+              isEditing ? "Laisser vide pour garder l'actuel" : "••••••••"
+            }
+            className={errors.password ? "error" : ""}
+            disabled={isEditing}
+            style={
+              isEditing
+                ? { backgroundColor: "#f5f5f5", cursor: "not-allowed" }
+                : {}
+            }
           />
-          {errors.email && (
-            <div className="ui pointing red basic label">{errors.email}</div>
+          {isEditing && (
+            <div
+              className="ui tiny info message"
+              style={{ marginTop: "0.25rem", padding: "0.25rem 0.5rem" }}
+            >
+              <small>
+                💡 Laisser vide pour conserver le mot de passe actuel
+              </small>
+            </div>
+          )}
+          {!isEditing && (
+            <div
+              className="ui tiny info message"
+              style={{ marginTop: "0.25rem", padding: "0.25rem 0.5rem" }}
+            >
+              <small>
+                💡 Par défaut: <strong>default123</strong>
+              </small>
+            </div>
+          )}
+          {errors.password && (
+            <div className="ui pointing red basic label">{errors.password}</div>
           )}
         </div>
       </div>

@@ -60,11 +60,15 @@ const userSchema = new mongoose.Schema(
     // Other fields
     matricule: {
       type: String,
-      default: "",
+      default: "null",
     },
     isActive: {
       type: Boolean,
       default: true,
+    },
+    isVerified: {
+      type: Boolean,
+      default: false,
     },
   },
   {
