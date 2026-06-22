@@ -1,8 +1,12 @@
 // server/controllers/driverController.js
 // FIXED:
-// 1. selectHospitalAndRoute: route from SOS → hospital using routeType (fastest/comfort)
-// 2. getRouteToHospital: same fix
-// 3. roadblock: immediate active status (no manager approval needed for driver)
+// 1. getCurrentAssignment / getRoute / recalculateRouteFunc : trajet SOS → driver
+//    utilise maintenant routingService.getBasePathAvoidingBlocked (algo de base,
+//    évite seulement les obstacles actifs) — PLUS de fastest/comfort sur ce segment.
+// 2. selectHospitalAndRoute / getRouteToHospital : inchangés, fastest/comfort
+//    s'appliquent UNIQUEMENT au trajet SOS → hôpital, comme prévu.
+// 3. roadblock : statut 'active' immédiat dès confirmation du driver (pas
+//    d'attente manager) — inchangé, déjà correct.
 
 import { pool } from "../config/database.js";
 import { User } from "../models/index.js";
@@ -10,17 +14,9 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import routingService from "../services/routingService.js";
 
-// ── Helper: recalculate route avoiding blocked road ───────────────────────
+// ── Helper: recalcule le trajet SOS en évitant les obstacles actifs ────────
+// FIX: utilise désormais l'algo de base (pas fastest avec facteur horaire)
 async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
-  const blockedEdges = await pool
-    .query(
-      `SELECT edge_id FROM blocked_roads
-     WHERE status = 'active' AND expires_at > NOW()`,
-    )
-    .catch(() => ({ rows: [] }));
-
-  const blockedIds = blockedEdges.rows.map((r) => r.edge_id);
-
   const ambulance = await pool.query(
     "SELECT latitude, longitude FROM ambulances WHERE id = $1",
     [ambulanceId],
@@ -35,10 +31,9 @@ async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
   if (!startVertex.success || !endVertex.success)
     return { success: false, error: "Cannot find vertices" };
 
-  return routingService.getPathAvoidingEdges(
+  return routingService.getBasePathAvoidingBlocked(
     startVertex.vertex_id,
     endVertex.vertex_id,
-    blockedIds,
     false,
   );
 }
@@ -116,6 +111,7 @@ class DriverController {
   }
 
   // ── Current assignment ──────────────────────────────────────────────────
+  // FIX: route_geometry (vers le SOS) calculée avec l'algo de base, pas fastest
   async getCurrentAssignment(req, res) {
     try {
       const ambulanceId = req.user.ambulanceId;
@@ -151,7 +147,6 @@ class DriverController {
 
       const assignment = result.rows[0];
 
-      // Get route geometry
       let eta = null,
         routeGeometry = null;
       try {
@@ -164,10 +159,10 @@ class DriverController {
           assignment.longitude_depart,
         );
         if (ambVertex.success && destVertex.success) {
-          const route = await routingService.getPathAvoidingEdges(
+          // FIX: algo de base (pas getPathAvoidingEdges/fastest) pour le trajet SOS
+          const route = await routingService.getBasePathAvoidingBlocked(
             ambVertex.vertex_id,
             destVertex.vertex_id,
-            [],
             false,
           );
           const etaResult = await routingService.calculateETAAdvanced(
@@ -284,11 +279,11 @@ class DriverController {
     }
   }
 
-  // ── Get route to intervention ───────────────────────────────────────────
+  // ── Get route to intervention (SOS) ─────────────────────────────────────
+  // FIX: ignore tout routeType reçu — toujours l'algo de base, évite les obstacles actifs
   async getRoute(req, res) {
     try {
       const { interventionId } = req.params;
-      const { routeType = "fastest" } = req.query;
       const ambulanceId = req.user.ambulanceId;
 
       const intervention = await pool.query(
@@ -322,21 +317,12 @@ class DriverController {
           .status(404)
           .json({ success: false, error: "Could not find route vertices" });
 
-      let route;
-      if (routeType === "comfort") {
-        route = await routingService.getComfortPath(
-          startVertex.vertex_id,
-          endVertex.vertex_id,
-          false,
-        );
-      } else {
-        route = await routingService.getPathAvoidingEdges(
-          startVertex.vertex_id,
-          endVertex.vertex_id,
-          [],
-          false,
-        );
-      }
+      // FIX: plus de branchement fastest/comfort ici — algo de base uniquement
+      const route = await routingService.getBasePathAvoidingBlocked(
+        startVertex.vertex_id,
+        endVertex.vertex_id,
+        false,
+      );
 
       res.json({
         success: true,
@@ -350,7 +336,6 @@ class DriverController {
             lon: intervention.rows[0].longitude_depart,
           },
           route: route.data || [],
-          routeType,
         },
       });
     } catch (error) {
@@ -358,8 +343,8 @@ class DriverController {
     }
   }
 
-  // ── FIXED: Get route to hospital ────────────────────────────────────────
-  // Route is calculated FROM the SOS location (emergency pickup) TO the hospital
+  // ── Get route to hospital ────────────────────────────────────────────────
+  // Inchangé : fastest/comfort s'applique ICI, et uniquement ici (segment SOS → hôpital)
   async getRouteToHospital(req, res) {
     try {
       const { interventionId } = req.params;
@@ -388,7 +373,6 @@ class DriverController {
           .status(400)
           .json({ success: false, error: "No hospital selected yet" });
 
-      // FIX: Start from ambulance current position (driver already at/near SOS)
       const ambulance = await pool.query(
         "SELECT latitude, longitude FROM ambulances WHERE id=$1",
         [ambulanceId],
@@ -413,12 +397,10 @@ class DriverController {
       const endVertex = await routingService.findNearestVertex(toLat, toLon);
 
       if (!startVertex.success || !endVertex.success)
-        return res
-          .status(404)
-          .json({
-            success: false,
-            error: "Could not find route on road network",
-          });
+        return res.status(404).json({
+          success: false,
+          error: "Could not find route on road network",
+        });
 
       let route;
       if (routeType === "comfort") {
@@ -482,28 +464,24 @@ class DriverController {
     }
   }
 
-  // ── FIXED: Select hospital and route ────────────────────────────────────
-  // routeType: "fastest" | "comfort" — affects SOS → hospital segment
+  // ── Select hospital and route ────────────────────────────────────────────
+  // Inchangé : routeType "fastest"/"comfort" affecte UNIQUEMENT le segment SOS → hôpital
   async selectHospitalAndRoute(req, res) {
     try {
       const { interventionId, hospitalId, routeType = "fastest" } = req.body;
       const ambulanceId = req.user.ambulanceId;
 
       if (!interventionId || !hospitalId)
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "interventionId and hospitalId required",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "interventionId and hospitalId required",
+        });
 
       if (!["fastest", "comfort"].includes(routeType))
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "routeType must be fastest or comfort",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "routeType must be fastest or comfort",
+        });
 
       const intervention = await pool.query(
         `SELECT i.id, i.statut, i.latitude_depart, i.longitude_depart,
@@ -521,12 +499,10 @@ class DriverController {
       const iData = intervention.rows[0];
       const allowed = ["en route", "transport", "arrived", "sur_place"];
       if (!allowed.includes(iData.statut))
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: `Status ${iData.statut} not allowed`,
-          });
+        return res.status(400).json({
+          success: false,
+          error: `Status ${iData.statut} not allowed`,
+        });
 
       const hospital = await pool.query(
         "SELECT id, nom, latitude, longitude FROM hopitaux WHERE id=$1",
@@ -545,7 +521,7 @@ class DriverController {
         [hospitalId, interventionId],
       );
 
-      // FIX: Route from SOS location → hospital
+      // Route from SOS location → hospital
       const sosLat = parseFloat(iData.latitude_depart);
       const sosLon = parseFloat(iData.longitude_depart);
 
@@ -680,7 +656,8 @@ class DriverController {
     }
   }
 
-  // ── FIXED: Report roadblock — immediately active, no approval needed ─────
+  // ── Report roadblock — immediately active, no approval needed ────────────
+  // Inchangé : déjà correct (statut 'active' immédiat, recalcul instantané)
   reportRoadblock = async (req, res) => {
     try {
       const { edge_id, reason, estimated_duration, tap_lat, tap_lon } =
@@ -700,11 +677,9 @@ class DriverController {
         edge_id && edge_id !== 0 ? parseInt(edge_id, 10) : null;
       const durationMinutes = estimated_duration || 30;
 
-      // FIX: if the client didn't resolve a precise edge (or sends none),
-      // resolve it server-side from the tapped coordinates so the stored
-      // edge_id always matches a REAL road segment at that exact position.
-      // This guarantees the manager map later shows the obstacle exactly
-      // where the driver tapped (no more position mismatch).
+      // Si le client n'a pas résolu d'edge précis, on le résout côté serveur
+      // à partir des coordonnées tapées, pour garantir que l'edge_id stocké
+      // correspond toujours à un VRAI segment de route à cet endroit exact.
       let finalEdgeId = actualEdgeId;
       if (!finalEdgeId && tap_lat && tap_lon) {
         const nearest = await routingService.findNearestEdge(
@@ -722,8 +697,6 @@ class DriverController {
       }
 
       // Insert as 'active' immediately (driver-reported = trusted, no manager approval)
-      // NOTE: column is "reported_by" (FK -> ambulances.id) on the real deployed schema,
-      // NOT "reported_by_ambulance".
       const inserted = await pool
         .query(
           `INSERT INTO blocked_roads
@@ -740,7 +713,7 @@ class DriverController {
           ],
         )
         .catch(async () => {
-          // Fallback for older/minimal schema (no reported_by_driver column yet, etc.)
+          // Fallback for older/minimal schema
           return pool.query(
             `INSERT INTO blocked_roads (edge_id, reason, estimated_duration, status, reported_by)
            VALUES ($1, $2, $3, 'active', $4) RETURNING id, edge_id`,
@@ -822,7 +795,6 @@ class DriverController {
           [edge_id, managerName],
         )
         .catch(() =>
-          // Fallback if cleared_by_name column doesn't exist yet
           pool.query(
             `UPDATE blocked_roads SET status = 'cleared', cleared_at = NOW()
            WHERE edge_id = $1 AND status = 'active' RETURNING id, edge_id`,
@@ -870,7 +842,6 @@ class DriverController {
       );
       res.json({ success: true, data: result.rows });
     } catch (error) {
-      // Table might not exist yet, or text columns not added — degrade gracefully
       try {
         const fallback = await pool.query(
           `SELECT br.id, br.edge_id, br.reason, br.estimated_duration,
@@ -937,6 +908,8 @@ class DriverController {
 
       const io = req.app.get("io");
       if (io) {
+        // Émis dans la room de l'intervention — c'est ce que TrackAmbulanceScreen
+        // (app user) écoute pour afficher "Ambulance en route" sans recharger.
         io.to(`intervention_${interventionId}`).emit("ambulance_assigned", {
           interventionId,
           ambulanceId,

@@ -1,5 +1,9 @@
 // server/services/routingService.js
-// FIXED: comfort path, fastest path avoiding blocked edges, hospital routing fix
+// FIXED:
+// - comfort path, fastest path avoiding blocked edges, hospital routing fix
+// - NOUVEAU: getBasePathAvoidingBlocked — algo de base (dijkstra simple, sans
+//   facteur horaire/trafic) utilisé pour le trajet SOS->driver. Il évite
+//   uniquement les obstacles actifs, jamais de "fastest"/"comfort" sur ce segment.
 
 import { pool } from "../config/database.js";
 
@@ -154,7 +158,76 @@ class RoutingService {
     }
   }
 
+  // ── NOUVEAU — Path SOS : dijkstra simple (PAS fastest/comfort) ───────────
+  // Évite uniquement les obstacles actifs (blocked_roads). Utilisé pour TOUT
+  // trajet ambulance -> SOS. Le fastest/comfort ne s'applique JAMAIS ici,
+  // uniquement sur le segment SOS -> hôpital (voir getPathAvoidingEdges /
+  // getComfortPath plus bas, appelés depuis driverController pour l'hôpital).
+  async getBasePathAvoidingBlocked(
+    startVertexId,
+    endVertexId,
+    directed = true,
+  ) {
+    try {
+      if (!startVertexId || !endVertexId)
+        return { success: false, error: "Missing vertex IDs" };
+
+      let dbBlocked = [];
+      try {
+        const res = await pool.query(
+          `SELECT edge_id FROM blocked_roads
+           WHERE status = 'active' AND expires_at > NOW()`,
+        );
+        dbBlocked = res.rows.map((r) => parseInt(r.edge_id, 10));
+      } catch {
+        /* table peut ne pas exister encore */
+      }
+
+      const blockedClause =
+        dbBlocked.length > 0 ? `AND w.gid NOT IN (${dbBlocked.join(",")})` : "";
+
+      const query = `
+        SELECT a.seq, a.node, a.edge, a.cost, a.agg_cost,
+               ST_AsGeoJSON(
+                 CASE WHEN a.node = w.source THEN w.the_geom
+                      ELSE ST_Reverse(w.the_geom) END
+               ) AS geometry
+        FROM pgr_dijkstra(
+          'SELECT gid::bigint AS id, source::bigint, target::bigint,
+                  (ST_Length(the_geom::geography) / (COALESCE(maxspeed_forward,40)*1000.0/3600.0)) AS cost,
+                  (ST_Length(the_geom::geography) / (COALESCE(maxspeed_backward,maxspeed_forward,40)*1000.0/3600.0)) AS reverse_cost
+           FROM ways w WHERE source IS NOT NULL ${blockedClause}',
+          $1::bigint, $2::bigint, $3::boolean
+        ) a
+        JOIN ways w ON a.edge = w.gid
+        ORDER BY a.seq
+      `;
+      const result = await pool.query(query, [
+        startVertexId,
+        endVertexId,
+        directed,
+      ]);
+
+      if (!result.rows?.length) {
+        console.warn(
+          "⚠️ Aucun trajet de base trouvé, fallback géométrie simple",
+        );
+        return this.getPathWithGeometry(startVertexId, endVertexId, directed);
+      }
+
+      return {
+        success: true,
+        data: result.rows,
+        meta: { blockedEdges: dbBlocked },
+      };
+    } catch (error) {
+      console.error("Base path avoiding blocked error:", error);
+      return this.getPathWithGeometry(startVertexId, endVertexId, directed);
+    }
+  }
+
   // ── FASTEST path: time-based, avoids blocked edges ───────────────────────
+  // Utilisé UNIQUEMENT pour le segment SOS -> hôpital (driverController)
   async getPathAvoidingEdges(
     startVertexId,
     endVertexId,
@@ -238,6 +311,7 @@ class RoutingService {
   }
 
   // ── COMFORT path: minimises speed bumps ──────────────────────────────────
+  // Utilisé UNIQUEMENT pour le segment SOS -> hôpital (driverController)
   async getComfortPath(startVertexId, endVertexId, directed = true) {
     try {
       if (!startVertexId || !endVertexId)
