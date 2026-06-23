@@ -28,7 +28,6 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
   const { ambulances, hopitaux } = useData();
   const isEditing = !!intervention?.id;
 
-  // Initialize form data - PRESERVE existing coordinates from intervention
   const getInitialDateTime = () => {
     if (intervention?.date_intervention) {
       return new Date(intervention.date_intervention)
@@ -72,7 +71,6 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [showGpsModal, setShowGpsModal] = useState(false);
 
-  // Debug: Log existing data when editing
   useEffect(() => {
     if (intervention) {
       console.log("📝 Editing intervention - Data:", {
@@ -146,9 +144,6 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
     if (!formData.dateTime) {
       newErrors.dateTime = "La date et heure sont requises";
     }
-    if (!formData.description.trim()) {
-      newErrors.description = "La description est requise";
-    }
     if (!formData.caller_name.trim()) {
       newErrors.caller_name = "Le nom de l'appelant est requis";
     }
@@ -182,24 +177,15 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
       priority: formData.priority,
     };
 
-    // Include coordinates if they exist
     if (formData.latitude && formData.longitude) {
       interventionData.latitude_depart = Number(formData.latitude);
       interventionData.longitude_depart = Number(formData.longitude);
     }
 
-    // Include ambulance if selected
     if (formData.ambulance_id) {
       interventionData.ambulance_id = Number(formData.ambulance_id);
     }
 
-    // Include hospital if selected
-    if (formData.hospital_id) {
-      interventionData.hopital_id = Number(formData.hospital_id);
-      interventionData.hospital_id = Number(formData.hospital_id);
-    }
-
-    // Include id when editing
     if (isEditing && formData.id) {
       interventionData.id = Number(formData.id);
     }
@@ -289,7 +275,7 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
         </div>
       </div>
 
-      {/* Emergency Type and Priority */}
+      {/* Emergency Type */}
       <div className="two fields">
         <div className="required field">
           <label>Type d'intervention</label>
@@ -311,27 +297,8 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
           )}
         </div>
 
-        <div className="field">
-          <label>Priorité</label>
-          <select
-            name="priority"
-            value={formData.priority}
-            onChange={handleChange}
-            className="ui dropdown"
-            style={{
-              borderLeft:
-                formData.priority === "urgent"
-                  ? "4px solid #ef4444"
-                  : formData.priority === "high"
-                    ? "4px solid #f59e0b"
-                    : "4px solid #10b981",
-            }}
-          >
-            <option value="normal">🟢 Normal</option>
-            <option value="high">🟠 Haute priorité</option>
-            <option value="urgent">🔴 Urgent</option>
-          </select>
-        </div>
+        {/* ✅ Priority - Caché (utilisé mais non affiché) */}
+        <input type="hidden" name="priority" value={formData.priority} />
       </div>
 
       {/* Status and Date */}
@@ -366,22 +333,8 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
         </div>
       </div>
 
-      <div className="required field">
-        <label>Description</label>
-        <textarea
-          name="description"
-          value={formData.description}
-          onChange={handleChange}
-          rows={3}
-          placeholder="Décrivez l'intervention en détail..."
-          className={errors.description ? "error" : ""}
-        />
-        {errors.description && (
-          <div className="ui pointing red basic label">
-            {errors.description}
-          </div>
-        )}
-      </div>
+      {/* ✅ Description - Caché (utilisé mais non affiché) */}
+      <input type="hidden" name="description" value={formData.description} />
 
       <div className="two fields">
         <div className="field">
@@ -419,22 +372,8 @@ const InterventionForm: React.FC<InterventionFormProps> = ({
           </div>
         </div>
 
-        <div className="field">
-          <label>Hôpital de destination</label>
-          <select
-            name="hospital_id"
-            value={formData.hospital_id}
-            onChange={handleChange}
-            className="ui dropdown"
-          >
-            <option value="">Non assigné</option>
-            {hopitaux.map((hopital) => (
-              <option key={hopital.id} value={hopital.id}>
-                🏥 {hopital.nom}
-              </option>
-            ))}
-          </select>
-        </div>
+        {/* ✅ Hospital destination - Caché (utilisé mais non affiché) */}
+        <input type="hidden" name="hospital_id" value={formData.hospital_id} />
       </div>
 
       {/* GPS Coordinates */}
