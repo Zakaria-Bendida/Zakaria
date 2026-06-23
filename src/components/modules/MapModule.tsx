@@ -1,11 +1,3 @@
-// MapModule.tsx — FIXED VERSION
-// FIXES:
-// 7. Roadblocks now use REAL edge coordinates (via /mobile/manager/roadblocks + /mobile/edges/:id/center)
-//    drawn as a RED LINE (not just a pin), no more "approve" step — manager just clears ("Dégager")
-//    clicking a roadblock card zooms the map to that obstacle
-// 8. Live-mode map no longer snaps back to a wider zoom every poll — view.fit() only runs
-//    once per ambulance/destination-type selection, not on every 10s refresh
-
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Map, View } from "ol";
 import { Tile as TileLayer, Vector as VectorLayer } from "ol/layer";
@@ -58,32 +50,94 @@ const ICONS = {
   enRoute: makeSVGIcon("🚨", "#ea580c"),
 };
 
+interface LatLng {
+  lat: number;
+  lng: number;
+}
+
 interface LiveRoute {
   route: [number, number][];
-  ambulanceLocation: { lat: number; lng: number };
-  destinationLocation: { lat: number; lng: number };
+  ambulanceLocation: LatLng;
+  destinationLocation: LatLng;
   eta: { minutes: number; km: number };
   ambulanceLabel: string;
   destinationType: "intervention" | "hospital";
   destinationName?: string;
 }
 
-// FIXED: roadblock now always carries real coords + center (no more pending/approve states)
 interface Roadblock {
   id: number;
   edge_id: string;
   reason: string;
   estimated_duration: number;
-  status: string; // "active" | "cleared"
+  status: string;
   blocked_at: string;
   expires_at: string;
   reported_by_ambulance: string;
   reported_by_driver: string;
   cleared_by_name: string;
   center?: { lat: number; lon: number } | null;
-  coords?: [number, number][]; // [lat, lon] pairs
+  coords?: [number, number][];
 }
 
+// ── SAME parsePgRoute as MissionScreen ────────────────────────────────────────
+// Chains segments in the correct direction using the driver's start position.
+function parsePgRoute(
+  segs: any[],
+  fromLat: number,
+  fromLon: number,
+): [number, number][] {
+  if (!segs || segs.length === 0) return [];
+
+  const allPts: [number, number][][] = [];
+  for (const seg of segs) {
+    if (!seg?.geometry) continue;
+    try {
+      const geo =
+        typeof seg.geometry === "string"
+          ? JSON.parse(seg.geometry)
+          : seg.geometry;
+      if (!Array.isArray(geo?.coordinates)) continue;
+      // geometry is [lon, lat] — keep as-is for OL (fromLonLat applied later)
+      const coords: [number, number][] = geo.coordinates.map(
+        ([lon, lat]: [number, number]) => [lon, lat],
+      );
+      if (coords.length >= 2) allPts.push(coords);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (allPts.length === 0) return [];
+
+  const result: [number, number][] = [];
+  let startPt: [number, number] = [fromLon, fromLat]; // [lon, lat]
+
+  for (const pts of allPts) {
+    const first = pts[0];
+    const last = pts[pts.length - 1];
+    const df =
+      Math.abs(first[0] - startPt[0]) + Math.abs(first[1] - startPt[1]);
+    const dl = Math.abs(last[0] - startPt[0]) + Math.abs(last[1] - startPt[1]);
+
+    if (dl < df) {
+      // segment is in reverse — flip it
+      const reversed = [...pts].reverse();
+      result.push(...reversed);
+      startPt = reversed[reversed.length - 1];
+    } else {
+      result.push(...pts);
+      startPt = pts[pts.length - 1];
+    }
+  }
+
+  // Deduplicate consecutive identical points
+  return result.filter(
+    (p, i) => i === 0 || p[0] !== result[i - 1][0] || p[1] !== result[i - 1][1],
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 const MapModule: React.FC = () => {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<Map | null>(null);
@@ -116,7 +170,7 @@ const MapModule: React.FC = () => {
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const socketRef = useRef<any>(null);
-  // FIX #8: only fit the view once per ambulance/destination — not on every poll
+  // Only fit bounds on first load of a given ambulance/destination pair
   const liveFitRef = useRef<{
     ambulanceId: number | null;
     destType: string | null;
@@ -129,47 +183,37 @@ const MapModule: React.FC = () => {
     useData();
   const sidiBelAbbesCenter = fromLonLat([-0.6298, 35.1919]);
 
-  const activeInterventions = interventions.filter(
-    (i) =>
-      i.statut === "en route" ||
-      i.statut === "en attente" ||
-      i.statut === "transport" ||
-      i.statut === "en_transport",
+  const activeInterventions = interventions.filter((i) =>
+    ["en route", "en attente", "transport", "en_transport"].includes(i.statut),
   );
-
-  const ambulancesEnMission = ambulances.filter((ambulance) =>
+  const ambulancesEnMission = ambulances.filter((a) =>
     interventions.some(
       (i) =>
-        i.ambulance_id === ambulance.id &&
-        (i.statut === "en route" ||
-          i.statut === "en attente" ||
-          i.statut === "transport" ||
-          i.statut === "en_transport"),
+        i.ambulance_id === a.id &&
+        ["en route", "en attente", "transport", "en_transport"].includes(
+          i.statut,
+        ),
     ),
   );
 
-  // ── FIXED: fetch roadblocks with REAL coords from backend (no per-edge guesswork) ──
+  // ── Roadblocks ─────────────────────────────────────────────────────────────
   const fetchRoadblocks = async () => {
     setLoadingRoadblocks(true);
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch(
-        `${API_BASE_URL}/mobile/manager/roadblocks`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        },
-      );
-      const data = await response.json();
+      const res = await fetch(`${API_BASE_URL}/mobile/manager/roadblocks`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
       if (data.success) {
-        // Only keep active ones for the map / panel
         const active = (data.data || []).filter(
           (rb: Roadblock) => rb.status === "active",
         );
         setRoadblocks(active);
         await drawRoadblocksOnMap(active);
       }
-    } catch (error) {
-      console.error("Error fetching roadblocks:", error);
+    } catch (e) {
+      console.error("fetchRoadblocks:", e);
     } finally {
       setLoadingRoadblocks(false);
     }
@@ -181,41 +225,31 @@ const MapModule: React.FC = () => {
     setRefreshingRoadblocks(false);
   };
 
-  // FIXED: fetch real edge center/geometry when not already embedded
-  const fetchEdgeGeometry = async (
-    edgeId: string,
-  ): Promise<{
-    center: { lat: number; lon: number } | null;
-    coords: [number, number][];
-  }> => {
+  const fetchEdgeGeometry = async (edgeId: string) => {
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch(
-        `${API_BASE_URL}/mobile/edges/${edgeId}/center`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        },
-      );
-      const data = await response.json();
+      const res = await fetch(`${API_BASE_URL}/mobile/edges/${edgeId}/center`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
       if (data.success) {
         let coords: [number, number][] = [];
         if (data.geometry) {
           try {
             const geo = JSON.parse(data.geometry);
-            coords = geo.coordinates as [number, number][]; // [lon, lat]
+            coords = geo.coordinates as [number, number][];
           } catch {
-            /* ignore parse errors */
+            /* ignore */
           }
         }
         return { center: data.center, coords };
       }
-    } catch (error) {
-      console.error("Error fetching edge geometry:", error);
+    } catch (e) {
+      console.error("fetchEdgeGeometry:", e);
     }
     return { center: null, coords: [] };
   };
 
-  // ── FIXED: draw roadblocks as RED LINES at their real position ───────────
   const drawRoadblocksOnMap = async (blocks: Roadblock[]) => {
     const sources = vectorSourcesRef.current;
     if (!sources) return;
@@ -224,8 +258,6 @@ const MapModule: React.FC = () => {
     for (const rb of blocks) {
       let coords = rb.coords;
       let center = rb.center;
-
-      // If the list endpoint didn't embed geometry, resolve it now (cached on the object)
       if ((!coords || coords.length < 2) && rb.edge_id) {
         const resolved = await fetchEdgeGeometry(rb.edge_id);
         coords = resolved.coords;
@@ -233,10 +265,8 @@ const MapModule: React.FC = () => {
         rb.coords = coords;
         rb.center = center;
       }
-
       if (coords && coords.length >= 2) {
         const olCoords = coords.map(([lon, lat]) => fromLonLat([lon, lat]));
-
         const glow = new Feature({ geometry: new LineString(olCoords) });
         glow.setStyle(
           new Style({
@@ -244,7 +274,6 @@ const MapModule: React.FC = () => {
           }),
         );
         sources.roadblocks.addFeature(glow);
-
         const line = new Feature({
           geometry: new LineString(olCoords),
           roadblockData: rb,
@@ -259,14 +288,12 @@ const MapModule: React.FC = () => {
           }),
         );
         sources.roadblocks.addFeature(line);
-
-        // Label at the midpoint
         const midIdx = Math.floor(olCoords.length / 2);
-        const labelFeature = new Feature({
+        const label = new Feature({
           geometry: new Point(olCoords[midIdx]),
           roadblockData: rb,
         });
-        labelFeature.setStyle(
+        label.setStyle(
           new Style({
             image: new Icon({
               src: makeSVGIcon("🚧", "#dc2626", 30),
@@ -283,9 +310,8 @@ const MapModule: React.FC = () => {
             }),
           }),
         );
-        sources.roadblocks.addFeature(labelFeature);
+        sources.roadblocks.addFeature(label);
       } else if (center) {
-        // Fallback: only a center point known, still show something at the right spot
         const f = new Feature({
           geometry: new Point(fromLonLat([center.lon, center.lat])),
           roadblockData: rb,
@@ -309,90 +335,91 @@ const MapModule: React.FC = () => {
         );
         sources.roadblocks.addFeature(f);
       }
-      // If neither coords nor center resolved, we simply skip drawing (it still appears in the list panel)
     }
   };
 
-  // ── FIXED: manager simply clears the obstacle, no approve step ───────────
   const clearRoadblock = async (edge_id: string, roadblockId: number) => {
     if (!window.confirm(`Dégager cet obstacle ?\nRoute ID: ${edge_id}`)) return;
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch(
+      const res = await fetch(
         `${API_BASE_URL}/mobile/manager/roadblock/${edge_id}`,
         {
           method: "DELETE",
           headers: { Authorization: `Bearer ${token}` },
         },
       );
-      const data = await response.json();
+      const data = await res.json();
       if (data.success) {
         setRoadblocks((prev) => prev.filter((rb) => rb.id !== roadblockId));
         await fetchRoadblocks();
-        if (socketRef.current) {
+        if (socketRef.current)
           socketRef.current.emit("manager:clear_roadblock", {
             edge_id,
             managerName: "Manager",
           });
-        }
       }
-    } catch (error) {
-      console.error("Error clearing roadblock:", error);
+    } catch (e) {
+      console.error("clearRoadblock:", e);
     }
   };
 
-  // FIX #7: clicking a roadblock card zooms the map to that obstacle
   const zoomToRoadblock = (rb: Roadblock) => {
     const map = mapInstanceRef.current;
     if (!map) return;
     let target: [number, number] | null = null;
     if (rb.center) target = [rb.center.lon, rb.center.lat];
-    else if (rb.coords && rb.coords.length > 0) {
+    else if (rb.coords?.length) {
       const mid = rb.coords[Math.floor(rb.coords.length / 2)];
       target = [mid[0], mid[1]];
     }
-    if (target) {
+    if (target)
       map
         .getView()
         .animate({ center: fromLonLat(target), zoom: 17, duration: 600 });
-    }
   };
 
-  // ── Socket.IO ──────────────────────────────────────────────────────────────
+  // ── Socket ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const socket = io(SOCKET_URL, { transports: ["websocket"] });
     socketRef.current = socket;
-
     const handleRefresh = () => {
       refreshData();
       setLastRefresh(new Date());
       fetchRoadblocks();
     };
-
-    socket.on("intervention:created", handleRefresh);
-    socket.on("intervention:updated", handleRefresh);
-    socket.on("intervention:completed", handleRefresh);
-    socket.on("intervention:cancelled", handleRefresh);
-    socket.on("ambulance:assigned", handleRefresh);
-    socket.on("ambulance_assigned", handleRefresh);
-    socket.on("driver:status", handleRefresh);
-    socket.on("mission:started", handleRefresh);
-    socket.on("mission:completed", handleRefresh);
-    socket.on("driver:location", handleRefresh);
-    // FIX #7: simplified events — only active / cleared exist now
+    [
+      "intervention:created",
+      "intervention:updated",
+      "intervention:completed",
+      "intervention:cancelled",
+      "ambulance:assigned",
+      "ambulance_assigned",
+      "driver:status",
+      "mission:started",
+      "mission:completed",
+      "driver:location",
+    ].forEach((ev) => socket.on(ev, handleRefresh));
     socket.on("roadblock_active", () => fetchRoadblocks());
     socket.on("roadblock_cleared", () => fetchRoadblocks());
-
+    // ── Real-time driver location → update ambulance marker without refetch ──
+    socket.on("ambulance_location", (data: any) => {
+      if (!vectorSourcesRef.current || activeMapMode !== "live") return;
+      if (data.ambulanceId !== selectedAmbulanceId) return;
+      updateAmbulanceMarker(
+        data.lat ?? data.latitude,
+        data.lng ?? data.longitude,
+      );
+    });
     socket.emit("manager:online", {
       managerId: "manager",
       managerName: "Manager",
     });
-
     return () => {
       socket.emit("manager:offline");
       socket.disconnect();
     };
-  }, [refreshData]);
+  }, [refreshData, activeMapMode, selectedAmbulanceId]);
 
   useEffect(() => {
     const poll = setInterval(() => {
@@ -407,7 +434,19 @@ const MapModule: React.FC = () => {
     fetchRoadblocks();
   }, []);
 
-  // ── Fetch live route (driver / manager) ──────────────────────────────────
+  // ── Update ambulance marker in place (no re-fit) ──────────────────────────
+  const updateAmbulanceMarker = (lat: number, lng: number) => {
+    const sources = vectorSourcesRef.current;
+    if (!sources) return;
+    // Find existing ambulance marker in liveMarkers and move it
+    sources.liveMarkers.getFeatures().forEach((f) => {
+      if (f.get("isAmbulance")) {
+        (f.getGeometry() as Point).setCoordinates(fromLonLat([lng, lat]));
+      }
+    });
+  };
+
+  // ── Fetch live route — uses parsePgRoute (same as driver) ─────────────────
   const fetchLiveRoute = useCallback(
     async (ambulanceId: number) => {
       const token = localStorage.getItem("token");
@@ -415,10 +454,9 @@ const MapModule: React.FC = () => {
         const activeIntervention = interventions.find(
           (i) =>
             i.ambulance_id === ambulanceId &&
-            (i.statut === "en route" ||
-              i.statut === "en attente" ||
-              i.statut === "transport" ||
-              i.statut === "en_transport"),
+            ["en route", "en attente", "transport", "en_transport"].includes(
+              i.statut,
+            ),
         );
         if (!activeIntervention) {
           setLiveAmbulanceRoute(null);
@@ -428,105 +466,96 @@ const MapModule: React.FC = () => {
         const ambulance = ambulances.find((a) => a.id === ambulanceId);
         const ambulanceRes = await fetch(
           `${API_BASE_URL}/ambulances/${ambulanceId}`,
-          { headers: { Authorization: `Bearer ${token}` } },
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          },
         );
         const ambulanceData = await ambulanceRes.json();
         if (!ambulanceData.success || !ambulanceData.data) return;
 
-        let destinationLat, destinationLon;
-        let destinationType: "intervention" | "hospital" = "intervention";
-        let destinationName = "";
+        const isTransport = ["transport", "en_transport"].includes(
+          activeIntervention.statut,
+        );
+        const destinationLat = isTransport
+          ? activeIntervention.hospital_lat
+          : activeIntervention.latitude_depart;
+        const destinationLon = isTransport
+          ? activeIntervention.hospital_lon
+          : activeIntervention.longitude_depart;
+        const destinationType = isTransport
+          ? "hospital"
+          : ("intervention" as const);
+        const destinationName = isTransport
+          ? activeIntervention.hospital_name || "Hôpital"
+          : `${activeIntervention.type} - ${activeIntervention.caller_name || "Urgence"}`;
 
-        const isTransport =
-          activeIntervention.statut === "transport" ||
-          activeIntervention.statut === "en_transport";
-        if (isTransport) {
-          destinationLat = activeIntervention.hospital_lat;
-          destinationLon = activeIntervention.hospital_lon;
-          destinationType = "hospital";
-          destinationName = activeIntervention.hospital_name || "Hôpital";
-        } else {
-          destinationLat = activeIntervention.latitude_depart;
-          destinationLon = activeIntervention.longitude_depart;
-          destinationType = "intervention";
-          destinationName = `${activeIntervention.type} - ${activeIntervention.caller_name || "Urgence"}`;
-        }
+        // ── Driver's current position (source of truth) ───────────────────────
+        const fromLat = ambulanceData.data.latitude as number;
+        const fromLon = ambulanceData.data.longitude as number;
 
-        let routeCoords: [number, number][] = [];
+        // ── Fetch route segments ──────────────────────────────────────────────
         const endpoint = isTransport
           ? `${API_BASE_URL}/mobile/driver/route-to-hospital/${activeIntervention.id}`
           : `${API_BASE_URL}/mobile/driver/route/${activeIntervention.id}`;
 
+        let routeCoords: [number, number][] = [];
         const routeRes = await fetch(endpoint, {
           headers: { Authorization: `Bearer ${token}` },
         });
         const routeData = await routeRes.json();
 
         if (routeData.success && routeData.data) {
-          let routeSegments = [];
+          let segments = [];
           if (routeData.data.route && Array.isArray(routeData.data.route))
-            routeSegments = routeData.data.route;
-          else if (Array.isArray(routeData.data))
-            routeSegments = routeData.data;
+            segments = routeData.data.route;
+          else if (Array.isArray(routeData.data)) segments = routeData.data;
 
-          if (routeSegments.length > 0) {
-            const sortedSegments = [...routeSegments].sort(
-              (a, b) => (a.seq || 0) - (b.seq || 0),
-            );
-            const allCoords: [number, number][] = [];
-            for (const segment of sortedSegments) {
-              if (!segment.geometry) continue;
-              try {
-                const geo =
-                  typeof segment.geometry === "string"
-                    ? JSON.parse(segment.geometry)
-                    : segment.geometry;
-                if (geo?.coordinates && Array.isArray(geo.coordinates)) {
-                  let coords: [number, number][] = geo.coordinates.map(
-                    ([lon, lat]: [number, number]) => [lon, lat],
-                  );
-                  if (allCoords.length > 0 && coords.length > 0) {
-                    const last = allCoords[allCoords.length - 1];
-                    const first = coords[0];
-                    const lastOfSegment = coords[coords.length - 1];
-                    const distToFirst = Math.hypot(
-                      last[0] - first[0],
-                      last[1] - first[1],
-                    );
-                    const distToLast = Math.hypot(
-                      last[0] - lastOfSegment[0],
-                      last[1] - lastOfSegment[1],
-                    );
-                    if (distToLast < distToFirst)
-                      coords = [...coords].reverse();
-                  }
-                  allCoords.push(...coords);
-                }
-              } catch {
-                /* ignore */
-              }
-            }
-            if (allCoords.length > 0) {
-              routeCoords = [allCoords[0]];
-              for (let i = 1; i < allCoords.length; i++) {
-                const p = allCoords[i],
-                  prev = allCoords[i - 1];
-                if (p[0] !== prev[0] || p[1] !== prev[1]) routeCoords.push(p);
-              }
-            }
+          if (segments.length > 0) {
+            // ── KEY FIX: use parsePgRoute with REAL driver position ───────────
+            // This guarantees the manager sees the same path direction as driver
+            routeCoords = parsePgRoute(segments, fromLat, fromLon);
           }
         }
 
-        if (routeCoords.length < 2 && destinationLat && destinationLon) {
-          const startLon = ambulanceData.data.longitude,
-            startLat = ambulanceData.data.latitude;
-          if (startLon && startLat)
-            routeCoords = [
-              [startLon, startLat],
-              [destinationLon, destinationLat],
-            ];
+        // OSRM fallback if pgRouting gave nothing
+        if (
+          routeCoords.length < 2 &&
+          destinationLat &&
+          destinationLon &&
+          fromLat &&
+          fromLon
+        ) {
+          try {
+            const url = `https://router.project-osrm.org/route/v1/driving/${fromLon},${fromLat};${destinationLon},${destinationLat}?overview=full&geometries=geojson`;
+            const res = await fetch(url);
+            const data = await res.json();
+            if (data.code === "Ok" && data.routes?.[0]) {
+              routeCoords = data.routes[0].geometry.coordinates as [
+                number,
+                number,
+              ][];
+              // OSRM returns [lon,lat] — already correct
+            }
+          } catch {
+            /* ignore */
+          }
         }
 
+        // Straight-line last resort
+        if (
+          routeCoords.length < 2 &&
+          fromLat &&
+          fromLon &&
+          destinationLat &&
+          destinationLon
+        ) {
+          routeCoords = [
+            [fromLon, fromLat],
+            [destinationLon, destinationLat],
+          ];
+        }
+
+        // ── ETA ───────────────────────────────────────────────────────────────
         let etaMinutes = 0,
           etaKm = 0;
         try {
@@ -545,13 +574,11 @@ const MapModule: React.FC = () => {
           }
         } catch {
           const R = 6371;
-          const dLat =
-            ((destinationLat - ambulanceData.data.latitude) * Math.PI) / 180;
-          const dLon =
-            ((destinationLon - ambulanceData.data.longitude) * Math.PI) / 180;
+          const dLat = ((destinationLat - fromLat) * Math.PI) / 180;
+          const dLon = ((destinationLon - fromLon) * Math.PI) / 180;
           const a =
             Math.sin(dLat / 2) ** 2 +
-            Math.cos((ambulanceData.data.latitude * Math.PI) / 180) *
+            Math.cos((fromLat * Math.PI) / 180) *
               Math.cos((destinationLat * Math.PI) / 180) *
               Math.sin(dLon / 2) ** 2;
           etaKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
@@ -560,36 +587,32 @@ const MapModule: React.FC = () => {
 
         setLiveAmbulanceRoute({
           route: routeCoords,
-          ambulanceLocation: {
-            lat: ambulanceData.data.latitude,
-            lng: ambulanceData.data.longitude,
-          },
+          ambulanceLocation: { lat: fromLat, lng: fromLon },
           destinationLocation: { lat: destinationLat, lng: destinationLon },
           eta: { minutes: etaMinutes, km: etaKm },
           ambulanceLabel: ambulance?.immatriculation || `#${ambulanceId}`,
           destinationType,
           destinationName,
         });
-      } catch (error) {
-        console.error("Erreur récupération live:", error);
+      } catch (e) {
+        console.error("fetchLiveRoute:", e);
       }
     },
     [interventions, ambulances],
   );
 
+  // ── Live polling ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (intervalRef.current) clearInterval(intervalRef.current);
-
     if (activeMapMode === "live" && selectedAmbulanceId) {
-      const activeIntervention = interventions.find(
+      const active = interventions.find(
         (i) =>
           i.ambulance_id === selectedAmbulanceId &&
-          (i.statut === "en route" ||
-            i.statut === "en attente" ||
-            i.statut === "transport" ||
-            i.statut === "en_transport"),
+          ["en route", "en attente", "transport", "en_transport"].includes(
+            i.statut,
+          ),
       );
-      if (!activeIntervention) {
+      if (!active) {
         alert("Cette ambulance n'a pas de mission active.");
         setActiveMapMode(null);
         setSelectedAmbulanceId(null);
@@ -599,26 +622,23 @@ const MapModule: React.FC = () => {
       fetchLiveRoute(selectedAmbulanceId).finally(() => setLiveLoading(false));
       intervalRef.current = setInterval(
         () => fetchLiveRoute(selectedAmbulanceId),
-        10000,
+        5000,
       );
     } else if (activeMapMode !== "live") {
       setLiveAmbulanceRoute(null);
       setSelectedAmbulanceId(null);
-      liveFitRef.current = { ambulanceId: null, destType: null }; // reset fit guard
+      liveFitRef.current = { ambulanceId: null, destType: null };
     }
-
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [activeMapMode, selectedAmbulanceId, fetchLiveRoute, interventions]);
 
-  // ── Init map once ─────────────────────────────────────────────────────────
+  // ── Init map ───────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
-
     const mkSrc = () => new VectorSource();
     const mkLayer = (src: VectorSource) => new VectorLayer({ source: src });
-
     const sources = {
       ambulance: mkSrc(),
       parking: mkSrc(),
@@ -629,7 +649,6 @@ const MapModule: React.FC = () => {
       roadblocks: mkSrc(),
     };
     vectorSourcesRef.current = sources;
-
     const map = new Map({
       target: mapRef.current,
       layers: [
@@ -644,7 +663,6 @@ const MapModule: React.FC = () => {
       ],
       view: new View({ center: sidiBelAbbesCenter, zoom: 13 }),
     });
-
     map.on("click", (event) => {
       const feature = map.forEachFeatureAtPixel(event.pixel, (f) => f);
       if (feature && feature.get("roadblockData")) {
@@ -652,21 +670,18 @@ const MapModule: React.FC = () => {
         setShowRoadblockPanel(true);
       }
     });
-
     mapInstanceRef.current = map;
     setTimeout(() => map.updateSize(), 100);
-
     return () => {
       map.setTarget(undefined);
       mapInstanceRef.current = null;
     };
   }, []);
 
-  // ── Draw entity markers ───────────────────────────────────────────────────
+  // ── Entity markers ─────────────────────────────────────────────────────────
   useEffect(() => {
     const sources = vectorSourcesRef.current;
     if (!sources) return;
-
     const mkMarker = (
       lon: number,
       lat: number,
@@ -692,12 +707,10 @@ const MapModule: React.FC = () => {
       );
       return f;
     };
-
     sources.ambulance.clear();
     sources.parking.clear();
     sources.hopital.clear();
     sources.intervention.clear();
-
     if (activeLayer === "all" || activeLayer === "ambulances")
       ambulances.forEach((a) => {
         if (a.latitude && a.longitude)
@@ -726,18 +739,15 @@ const MapModule: React.FC = () => {
       });
     if (activeLayer === "all" || activeLayer === "interventions")
       activeInterventions.forEach((i) => {
-        if (i.latitude_depart && i.longitude_depart) {
-          const icon =
-            i.statut === "en route" ? ICONS.enRoute : ICONS.intervention;
+        if (i.latitude_depart && i.longitude_depart)
           sources.intervention.addFeature(
             mkMarker(
               i.longitude_depart,
               i.latitude_depart,
-              icon,
-              `${i.type} — ${i.statut === "transport" || i.statut === "en_transport" ? "Transport" : i.statut}`,
+              i.statut === "en route" ? ICONS.enRoute : ICONS.intervention,
+              `${i.type} — ${["transport", "en_transport"].includes(i.statut) ? "Transport" : i.statut}`,
             ),
           );
-        }
       });
   }, [
     ambulances,
@@ -748,7 +758,7 @@ const MapModule: React.FC = () => {
     hideIcons,
   ]);
 
-  // ── Draw live route — FIX #8: only fit bounds once per session ───────────
+  // ── Draw live route — only fit view on first load ─────────────────────────
   useEffect(() => {
     const sources = vectorSourcesRef.current;
     const map = mapInstanceRef.current;
@@ -756,7 +766,6 @@ const MapModule: React.FC = () => {
 
     sources.liveRoute.clear();
     sources.liveMarkers.clear();
-
     if (activeMapMode !== "live" || !liveAmbulanceRoute) return;
 
     const {
@@ -766,90 +775,66 @@ const MapModule: React.FC = () => {
       destinationType,
       destinationName,
     } = liveAmbulanceRoute;
-
-    // FIX #8: decide whether we should re-fit the view this time
     const shouldFit =
       liveFitRef.current.ambulanceId !== selectedAmbulanceId ||
       liveFitRef.current.destType !== destinationType;
+    const routeColor = destinationType === "hospital" ? "#7c3aed" : "#2563eb";
+    const shadowColor =
+      destinationType === "hospital"
+        ? "rgba(124,58,237,0.15)"
+        : "rgba(37,99,235,0.15)";
 
     if (route && route.length >= 2) {
-      const firstPoint = route[0],
-        lastPoint = route[route.length - 1];
-      const isIdentical =
-        firstPoint &&
-        lastPoint &&
-        firstPoint[0] === lastPoint[0] &&
-        firstPoint[1] === lastPoint[1];
-
-      if (!isIdentical && firstPoint && lastPoint) {
-        const routeColor =
-          destinationType === "hospital" ? "#7c3aed" : "#2563eb";
-        const routeShadowColor =
-          destinationType === "hospital"
-            ? "rgba(124,58,237,0.15)"
-            : "rgba(37,99,235,0.15)";
-
-        try {
-          const olCoords = route.map(([lon, lat]) => fromLonLat([lon, lat]));
-
-          const shadow = new Feature({ geometry: new LineString(olCoords) });
-          shadow.setStyle(
-            new Style({
-              stroke: new Stroke({ color: routeShadowColor, width: 14 }),
+      try {
+        const olCoords = route.map(([lon, lat]) => fromLonLat([lon, lat]));
+        const shadow = new Feature({ geometry: new LineString(olCoords) });
+        shadow.setStyle(
+          new Style({ stroke: new Stroke({ color: shadowColor, width: 14 }) }),
+        );
+        sources.liveRoute.addFeature(shadow);
+        const main = new Feature({ geometry: new LineString(olCoords) });
+        main.setStyle(
+          new Style({ stroke: new Stroke({ color: routeColor, width: 5 }) }),
+        );
+        sources.liveRoute.addFeature(main);
+        const dash = new Feature({ geometry: new LineString(olCoords) });
+        dash.setStyle(
+          new Style({
+            stroke: new Stroke({
+              color: "rgba(255,255,255,0.7)",
+              width: 2,
+              lineDash: [12, 10],
             }),
-          );
-          sources.liveRoute.addFeature(shadow);
+          }),
+        );
+        sources.liveRoute.addFeature(dash);
 
-          const main = new Feature({ geometry: new LineString(olCoords) });
-          main.setStyle(
-            new Style({ stroke: new Stroke({ color: routeColor, width: 5 }) }),
-          );
-          sources.liveRoute.addFeature(main);
-
-          const dash = new Feature({ geometry: new LineString(olCoords) });
-          dash.setStyle(
-            new Style({
-              stroke: new Stroke({
-                color: "rgba(255,255,255,0.7)",
-                width: 2,
-                lineDash: [12, 10],
-              }),
-            }),
-          );
-          sources.liveRoute.addFeature(dash);
-
-          // FIX #8: only fit on first load of this ambulance/destination, never again
-          if (shouldFit) {
-            const extent = main.getGeometry()!.getExtent();
-            if (
-              extent &&
-              !isNaN(extent[0]) &&
-              !isNaN(extent[1]) &&
-              !isNaN(extent[2]) &&
-              !isNaN(extent[3])
-            ) {
-              map.getView().fit(extent, {
-                padding: [60, 60, 60, 60],
-                maxZoom: 16,
-                duration: 800,
-              });
-            }
-            liveFitRef.current = {
-              ambulanceId: selectedAmbulanceId,
-              destType: destinationType,
-            };
+        if (shouldFit) {
+          const extent = main.getGeometry()!.getExtent();
+          if (extent && extent.every((v) => !isNaN(v))) {
+            map.getView().fit(extent, {
+              padding: [60, 60, 60, 60],
+              maxZoom: 16,
+              duration: 800,
+            });
           }
-        } catch (error) {
-          console.error("Error drawing route:", error);
+          liveFitRef.current = {
+            ambulanceId: selectedAmbulanceId,
+            destType: destinationType,
+          };
         }
+      } catch (e) {
+        console.error("draw live route:", e);
       }
     }
 
+    // ── Ambulance marker — tagged isAmbulance for real-time updates ──────────
     if (ambulanceLocation?.lat && ambulanceLocation?.lng) {
       const ambF = new Feature({
         geometry: new Point(
           fromLonLat([ambulanceLocation.lng, ambulanceLocation.lat]),
         ),
+        isAmbulance: true,
       });
       ambF.setStyle(
         new Style({
@@ -870,6 +855,7 @@ const MapModule: React.FC = () => {
       sources.liveMarkers.addFeature(ambF);
     }
 
+    // Destination marker
     if (destinationLocation?.lat && destinationLocation?.lng) {
       const destIcon =
         destinationType === "hospital" ? ICONS.hopital : ICONS.enRoute;
@@ -924,25 +910,24 @@ const MapModule: React.FC = () => {
     if (activeMapMode === "live") {
       setActiveMapMode(null);
       setShowAmbulancePicker(false);
-    } else {
-      if (ambulancesEnMission.length === 0) {
-        alert("Aucune ambulance en mission.");
-        return;
-      }
-      setActiveMapMode("live");
-      setShowAmbulancePicker(true);
+      return;
     }
+    if (ambulancesEnMission.length === 0) {
+      alert("Aucune ambulance en mission.");
+      return;
+    }
+    setActiveMapMode("live");
+    setShowAmbulancePicker(true);
   };
 
   const activeCount = roadblocks.filter((r) => r.status === "active").length;
-
-  const formatTime = (dateStr: string) => {
-    if (!dateStr) return "—";
-    return new Date(dateStr).toLocaleTimeString("fr-FR", {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  };
+  const formatTime = (d: string) =>
+    d
+      ? new Date(d).toLocaleTimeString("fr-FR", {
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : "—";
 
   return (
     <div className="map-module">
@@ -992,10 +977,9 @@ const MapModule: React.FC = () => {
             className={`btn-tool ${hideIcons ? "active-warning" : ""}`}
             onClick={() => setHideIcons(!hideIcons)}
           >
-            {hideIcons ? <Eye size={13} /> : <EyeOff size={13} />}
+            {hideIcons ? <Eye size={13} /> : <EyeOff size={13} />}{" "}
             {hideIcons ? "Afficher" : "Masquer"}
           </button>
-
           <div style={{ position: "relative" }}>
             <button
               className={`btn-tool ${showRoadblockPanel ? "active-live" : ""}`}
@@ -1010,7 +994,6 @@ const MapModule: React.FC = () => {
               )}
             </button>
           </div>
-
           <div style={{ position: "relative" }}>
             <button
               className={`btn-tool ${activeMapMode === "live" ? "active-live" : ""}`}
@@ -1024,7 +1007,6 @@ const MapModule: React.FC = () => {
               )}
               <ChevronDown size={11} />
             </button>
-
             {showAmbulancePicker && ambulancesEnMission.length > 0 && (
               <div className="ambulance-picker">
                 <div className="picker-header">
@@ -1037,14 +1019,16 @@ const MapModule: React.FC = () => {
                   const intervention = interventions.find(
                     (i) =>
                       i.ambulance_id === amb.id &&
-                      (i.statut === "en route" ||
-                        i.statut === "en attente" ||
-                        i.statut === "transport" ||
-                        i.statut === "en_transport"),
+                      [
+                        "en route",
+                        "en attente",
+                        "transport",
+                        "en_transport",
+                      ].includes(i.statut),
                   );
-                  const isTransport =
-                    intervention?.statut === "transport" ||
-                    intervention?.statut === "en_transport";
+                  const isTransport = ["transport", "en_transport"].includes(
+                    intervention?.statut || "",
+                  );
                   return (
                     <button
                       key={amb.id}
@@ -1097,7 +1081,6 @@ const MapModule: React.FC = () => {
         </div>
       </div>
 
-      {/* FIXED: Roadblock Panel — simplified, no approve/reject, click → zoom */}
       {showRoadblockPanel && (
         <div className="roadblock-panel">
           <div className="panel-header">
@@ -1111,7 +1094,6 @@ const MapModule: React.FC = () => {
                 className="panel-refresh"
                 onClick={refreshRoadblocks}
                 disabled={refreshingRoadblocks}
-                title="Rafraîchir"
               >
                 <RefreshCcw size={14} />
               </button>
@@ -1123,14 +1105,12 @@ const MapModule: React.FC = () => {
               </button>
             </div>
           </div>
-
           <div className="panel-stats">
             <div className="stat-item active">
               <span className="stat-count">{activeCount}</span>
               <span className="stat-label">Actifs</span>
             </div>
           </div>
-
           <div className="panel-content">
             {loadingRoadblocks ? (
               <div className="empty-state">Chargement...</div>
@@ -1275,90 +1255,84 @@ const MapModule: React.FC = () => {
       </div>
 
       <style>{`
-        .map-module { padding: 20px; background: #f5f7fa; min-height: 100vh; position: relative; }
-        .module-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; flex-wrap: wrap; gap: 10px; }
-        .module-title { display: flex; align-items: center; gap: 10px; font-size: 21px; font-weight: 700; color: #1e293b; margin: 0; }
-        .refresh-badge { font-size: 11px; color: #64748b; background: #f1f5f9; padding: 3px 8px; border-radius: 20px; border: 1px solid #e2e8f0; }
-        .btn { display: inline-flex; align-items: center; gap: 7px; padding: 7px 13px; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; transition: all .2s; }
-        .btn-secondary { background: white; color: #475569; border: 1px solid #e2e8f0; }
-        .btn-secondary:hover { background: #f8fafc; }
-        .controls-section { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; justify-content: space-between; align-items: flex-start; }
-        .layer-buttons, .tool-buttons, .zoom-buttons { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-        .btn-layer, .btn-tool { padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; transition: all .2s; border: 1px solid #e2e8f0; background: white; color: #475569; display: inline-flex; align-items: center; gap: 5px; }
-        .btn-layer:hover, .btn-tool:hover { background: #f1f5f9; }
-        .btn-layer.active, .btn-tool.active { background: #e0e7ff; border-color: #818cf8; color: #4338ca; }
-        .btn-tool.active-live { background: #dc2626; color: white; border-color: #dc2626; }
-        .btn-tool.active-warning { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
-        .live-dot { width: 7px; height: 7px; border-radius: 50%; background: white; animation: blink 1s infinite; display: inline-block; }
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
-        .badge { background: #dc2626; color: white; border-radius: 10px; font-size: 9px; padding: 1px 5px; font-weight: 700; margin-left: 4px; }
-        .badge-danger { background: #ef4444; color: white; border-radius: 10px; font-size: 9px; padding: 1px 5px; font-weight: 700; margin-left: 4px; animation: pulse 1s infinite; }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
-        .btn-icon { padding: 5px; border-radius: 6px; cursor: pointer; border: 1px solid #e2e8f0; background: white; color: #475569; display: inline-flex; align-items: center; transition: all .2s; }
-        .btn-icon:hover { background: #f1f5f9; }
-        .ambulance-picker { position: absolute; top: calc(100% + 6px); right: 0; z-index: 1000; background: white; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.15); border: 1px solid #e2e8f0; min-width: 300px; overflow: hidden; }
-        .picker-header { display: flex; align-items: center; justify-content: space-between; padding: 9px 13px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 12px; font-weight: 600; color: #475569; }
-        .picker-header button { background: none; border: none; cursor: pointer; color: #94a3b8; display: flex; }
-        .picker-item { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 13px; border: none; background: white; cursor: pointer; border-bottom: 1px solid #f1f5f9; transition: background .15s; text-align: left; }
-        .picker-item:hover { background: #f8fafc; }
-        .picker-item.selected { background: #eff6ff; }
-        .picker-icon { font-size: 22px; }
-        .picker-info { flex: 1; }
-        .picker-plate { font-size: 13px; font-weight: 700; color: #1e293b; }
-        .picker-dest { font-size: 11px; color: #64748b; margin-top: 2px; }
-        .picker-status { font-size: 10px; background: #fef3c7; color: #92400e; padding: 2px 7px; border-radius: 10px; font-weight: 600; white-space: nowrap; }
-        .picker-status.transport { background: #e9d5ff; color: #6b21a5; }
-        .live-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 10px 16px; background: #1e40af; border-radius: 10px; margin-bottom: 12px; color: white; font-size: 13px; }
-        .live-bar.hospital-mode { background: #6d28d9; }
-        .live-ambulance { display: flex; align-items: center; gap: 6px; }
-        .live-destination { display: flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.2); padding: 4px 10px; border-radius: 20px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .live-eta, .live-distance { display: flex; align-items: center; gap: 4px; }
-        .live-change-btn { background: rgba(255,255,255,.2); border: none; color: white; border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; display: flex; align-items: center; gap: 4px; margin-left: auto; }
-        .live-change-btn:hover { background: rgba(255,255,255,.3); }
-        .roadblock-panel { position: absolute; bottom: 20px; right: 20px; width: 380px; background: white; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.15); border: 1px solid #e2e8f0; z-index: 1000; max-height: 500px; display: flex; flex-direction: column; overflow: hidden; }
-        .panel-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
-        .panel-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; color: #1e293b; }
-        .panel-actions { display: flex; gap: 6px; align-items: center; }
-        .panel-refresh, .panel-close { background: none; border: none; cursor: pointer; color: #94a3b8; padding: 6px; border-radius: 6px; display: flex; align-items: center; transition: all .2s; }
-        .panel-refresh:hover { background: #eff6ff; color: #3b82f6; }
-        .panel-close:hover { background: #fee2e2; color: #dc2626; }
-        .panel-stats { display: flex; gap: 8px; padding: 12px 16px; background: white; border-bottom: 1px solid #f1f5f9; }
-        .stat-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px; border-radius: 10px; background: #f8fafc; }
-        .stat-item.active .stat-count { color: #dc2626; }
-        .stat-count { font-size: 20px; font-weight: 700; }
-        .stat-label { font-size: 10px; color: #64748b; font-weight: 500; }
-        .panel-content { overflow-y: auto; padding: 12px; max-height: 350px; }
-        .roadblock-card { background: white; border-radius: 12px; margin-bottom: 12px; border: 1px solid #e2e8f0; overflow: hidden; transition: all .2s; }
-        .roadblock-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); transform: translateY(-1px); }
-        .roadblock-card.active { border-left: 3px solid #dc2626; background: #fef2f2; }
-        .card-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid #f1f5f9; }
-        .card-status { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; }
-        .status-text.active { color: #dc2626; }
-        .card-time { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #94a3b8; }
-        .card-body { padding: 12px; }
-        .card-edge { font-family: monospace; font-size: 11px; font-weight: 600; color: #1e293b; margin-bottom: 6px; }
-        .card-reason { font-size: 13px; font-weight: 500; color: #1e293b; margin-bottom: 8px; }
-        .card-duration { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #64748b; margin-bottom: 8px; }
-        .card-meta { display: flex; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
-        .meta-item { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #64748b; }
-        .card-actions { padding: 8px 12px 12px; display: flex; gap: 8px; flex-wrap: wrap; }
-        .action-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 8px; font-size: 11px; font-weight: 600; cursor: pointer; border: none; transition: all .2s; }
-        .action-btn.clear { background: #3b82f6; color: white; }
-        .action-btn.clear:hover { background: #2563eb; }
-        .empty-state { text-align: center; padding: 40px; color: #94a3b8; display: flex; flex-direction: column; align-items: center; gap: 12px; }
-        .loading-spinner { display: inline-block; width: 14px; height: 14px; margin-left: 8px; border: 2px solid #e2e8f0; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.6s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; padding: 9px 14px; background: white; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.07); align-items: center; }
-        .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #475569; }
-        .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-        .legend-line { width: 20px; height: 4px; border-radius: 2px; display: inline-block; }
-        @media (max-width: 768px) {
-          .controls-section { flex-direction: column; }
-          .roadblock-panel { width: calc(100% - 40px); right: 20px; left: 20px; bottom: 20px; }
-          .live-bar { flex-direction: column; align-items: flex-start; }
-          .live-change-btn { margin-left: 0; }
-          .live-destination { max-width: 100%; overflow: visible; white-space: normal; }
-        }
+        .map-module{padding:20px;background:#f5f7fa;min-height:100vh;position:relative}
+        .module-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px}
+        .module-title{display:flex;align-items:center;gap:10px;font-size:21px;font-weight:700;color:#1e293b;margin:0}
+        .refresh-badge{font-size:11px;color:#64748b;background:#f1f5f9;padding:3px 8px;border-radius:20px;border:1px solid #e2e8f0}
+        .btn{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;border:none;transition:all .2s}
+        .btn-secondary{background:white;color:#475569;border:1px solid #e2e8f0}
+        .btn-secondary:hover{background:#f8fafc}
+        .controls-section{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;justify-content:space-between;align-items:flex-start}
+        .layer-buttons,.tool-buttons,.zoom-buttons{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+        .btn-layer,.btn-tool{padding:5px 10px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:all .2s;border:1px solid #e2e8f0;background:white;color:#475569;display:inline-flex;align-items:center;gap:5px}
+        .btn-layer:hover,.btn-tool:hover{background:#f1f5f9}
+        .btn-layer.active,.btn-tool.active{background:#e0e7ff;border-color:#818cf8;color:#4338ca}
+        .btn-tool.active-live{background:#dc2626;color:white;border-color:#dc2626}
+        .btn-tool.active-warning{background:#fef3c7;border-color:#f59e0b;color:#92400e}
+        .live-dot{width:7px;height:7px;border-radius:50%;background:white;animation:blink 1s infinite;display:inline-block}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+        .badge{background:#dc2626;color:white;border-radius:10px;font-size:9px;padding:1px 5px;font-weight:700;margin-left:4px}
+        .badge-danger{background:#ef4444;color:white;border-radius:10px;font-size:9px;padding:1px 5px;font-weight:700;margin-left:4px;animation:pulse 1s infinite}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+        .btn-icon{padding:5px;border-radius:6px;cursor:pointer;border:1px solid #e2e8f0;background:white;color:#475569;display:inline-flex;align-items:center;transition:all .2s}
+        .btn-icon:hover{background:#f1f5f9}
+        .ambulance-picker{position:absolute;top:calc(100% + 6px);right:0;z-index:1000;background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.15);border:1px solid #e2e8f0;min-width:300px;overflow:hidden}
+        .picker-header{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:12px;font-weight:600;color:#475569}
+        .picker-header button{background:none;border:none;cursor:pointer;color:#94a3b8;display:flex}
+        .picker-item{width:100%;display:flex;align-items:center;gap:10px;padding:10px 13px;border:none;background:white;cursor:pointer;border-bottom:1px solid #f1f5f9;transition:background .15s;text-align:left}
+        .picker-item:hover{background:#f8fafc}
+        .picker-item.selected{background:#eff6ff}
+        .picker-icon{font-size:22px}
+        .picker-info{flex:1}
+        .picker-plate{font-size:13px;font-weight:700;color:#1e293b}
+        .picker-dest{font-size:11px;color:#64748b;margin-top:2px}
+        .picker-status{font-size:10px;background:#fef3c7;color:#92400e;padding:2px 7px;border-radius:10px;font-weight:600;white-space:nowrap}
+        .picker-status.transport{background:#e9d5ff;color:#6b21a5}
+        .live-bar{display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding:10px 16px;background:#1e40af;border-radius:10px;margin-bottom:12px;color:white;font-size:13px}
+        .live-bar.hospital-mode{background:#6d28d9}
+        .live-ambulance{display:flex;align-items:center;gap:6px}
+        .live-destination{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.2);padding:4px 10px;border-radius:20px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .live-eta,.live-distance{display:flex;align-items:center;gap:4px}
+        .live-change-btn{background:rgba(255,255,255,.2);border:none;color:white;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:4px;margin-left:auto}
+        .live-change-btn:hover{background:rgba(255,255,255,.3)}
+        .roadblock-panel{position:absolute;bottom:20px;right:20px;width:380px;background:white;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.15);border:1px solid #e2e8f0;z-index:1000;max-height:500px;display:flex;flex-direction:column;overflow:hidden}
+        .panel-header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
+        .panel-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;color:#1e293b}
+        .panel-actions{display:flex;gap:6px;align-items:center}
+        .panel-refresh,.panel-close{background:none;border:none;cursor:pointer;color:#94a3b8;padding:6px;border-radius:6px;display:flex;align-items:center;transition:all .2s}
+        .panel-refresh:hover{background:#eff6ff;color:#3b82f6}
+        .panel-close:hover{background:#fee2e2;color:#dc2626}
+        .panel-stats{display:flex;gap:8px;padding:12px 16px;background:white;border-bottom:1px solid #f1f5f9}
+        .stat-item{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px;border-radius:10px;background:#f8fafc}
+        .stat-item.active .stat-count{color:#dc2626}
+        .stat-count{font-size:20px;font-weight:700}
+        .stat-label{font-size:10px;color:#64748b;font-weight:500}
+        .panel-content{overflow-y:auto;padding:12px;max-height:350px}
+        .roadblock-card{background:white;border-radius:12px;margin-bottom:12px;border:1px solid #e2e8f0;overflow:hidden;transition:all .2s}
+        .roadblock-card:hover{box-shadow:0 2px 8px rgba(0,0,0,0.1);transform:translateY(-1px)}
+        .roadblock-card.active{border-left:3px solid #dc2626;background:#fef2f2}
+        .card-header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#f8fafc;border-bottom:1px solid #f1f5f9}
+        .card-status{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600}
+        .status-text.active{color:#dc2626}
+        .card-time{display:flex;align-items:center;gap:4px;font-size:10px;color:#94a3b8}
+        .card-body{padding:12px}
+        .card-edge{font-family:monospace;font-size:11px;font-weight:600;color:#1e293b;margin-bottom:6px}
+        .card-reason{font-size:13px;font-weight:500;color:#1e293b;margin-bottom:8px}
+        .card-duration{display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b;margin-bottom:8px}
+        .card-meta{display:flex;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+        .meta-item{display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b}
+        .card-actions{padding:8px 12px 12px;display:flex;gap:8px;flex-wrap:wrap}
+        .action-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+        .action-btn.clear{background:#3b82f6;color:white}
+        .action-btn.clear:hover{background:#2563eb}
+        .empty-state{text-align:center;padding:40px;color:#94a3b8;display:flex;flex-direction:column;align-items:center;gap:12px}
+        .loading-spinner{display:inline-block;width:14px;height:14px;margin-left:8px;border:2px solid #e2e8f0;border-top-color:#3b82f6;border-radius:50%;animation:spin 0.6s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;padding:9px 14px;background:white;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.07);align-items:center}
+        .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:#475569}
+        .legend-dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
+        .legend-line{width:20px;height:4px;border-radius:2px;display:inline-block}
+        @media(max-width:768px){.controls-section{flex-direction:column}.roadblock-panel{width:calc(100% - 40px);right:20px;left:20px;bottom:20px}.live-bar{flex-direction:column;align-items:flex-start}.live-change-btn{margin-left:0}.live-destination{max-width:100%;overflow:visible;white-space:normal}}
       `}</style>
     </div>
   );
