@@ -18,7 +18,6 @@ import {
   Activity,
   Building,
   AlertTriangle,
-  ChevronDown,
   X,
   EyeOff,
   Eye,
@@ -159,25 +158,20 @@ const MapModule: React.FC = () => {
   const [loadingRoadblocks, setLoadingRoadblocks] = useState(false);
   const [refreshingRoadblocks, setRefreshingRoadblocks] = useState(false);
 
-  const [liveAmbulanceRoute, setLiveAmbulanceRoute] =
-    useState<LiveRoute | null>(null);
+  // FIX #4: liveRoutes contient désormais TOUTES les ambulances en mission
+  // (clé = ambulanceId), plus une seule à la fois — chaque trajet dessiné
+  // côté driver doit aussi apparaître ici, simultanément.
+  const [liveRoutes, setLiveRoutes] = useState<Record<number, LiveRoute>>({});
   const [selectedAmbulanceId, setSelectedAmbulanceId] = useState<number | null>(
     null,
   );
-  const [showAmbulancePicker, setShowAmbulancePicker] = useState(false);
   const [liveLoading, setLiveLoading] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const socketRef = useRef<any>(null);
-  // Only fit bounds on first load of a given ambulance/destination pair
-  const liveFitRef = useRef<{
-    ambulanceId: number | null;
-    destType: string | null;
-  }>({
-    ambulanceId: null,
-    destType: null,
-  });
+  // Ne recadrer la vue qu'une seule fois (sur l'ensemble des trajets actifs)
+  const hasFitAllRef = useRef(false);
 
   const { ambulances, parkings, hopitaux, interventions, refreshData } =
     useData();
@@ -379,6 +373,48 @@ const MapModule: React.FC = () => {
         .animate({ center: fromLonLat(target), zoom: 17, duration: 600 });
   };
 
+  // ── Focus / zoom sur une ambulance précise (parmi celles affichées) ───────
+  const focusAmbulance = (ambulanceId: number) => {
+    setSelectedAmbulanceId(ambulanceId);
+    const lr = liveRoutes[ambulanceId];
+    const map = mapInstanceRef.current;
+    if (lr?.ambulanceLocation && map) {
+      map.getView().animate({
+        center: fromLonLat([
+          lr.ambulanceLocation.lng,
+          lr.ambulanceLocation.lat,
+        ]),
+        zoom: 16,
+        duration: 600,
+      });
+    }
+  };
+
+  // ── Met à jour la position d'UNE ambulance précise (par ambulanceId) ──────
+  const updateAmbulanceMarker = (
+    ambulanceId: number,
+    lat: number,
+    lng: number,
+  ) => {
+    const sources = vectorSourcesRef.current;
+    if (!sources) return;
+    sources.liveMarkers.getFeatures().forEach((f) => {
+      if (f.get("isAmbulance") && f.get("ambulanceId") === ambulanceId) {
+        (f.getGeometry() as Point).setCoordinates(fromLonLat([lng, lat]));
+      }
+    });
+    setLiveRoutes((prev) => {
+      if (!prev[ambulanceId]) return prev;
+      return {
+        ...prev,
+        [ambulanceId]: {
+          ...prev[ambulanceId],
+          ambulanceLocation: { lat, lng },
+        },
+      };
+    });
+  };
+
   // ── Socket ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const socket = io(SOCKET_URL, { transports: ["websocket"] });
@@ -402,11 +438,14 @@ const MapModule: React.FC = () => {
     ].forEach((ev) => socket.on(ev, handleRefresh));
     socket.on("roadblock_active", () => fetchRoadblocks());
     socket.on("roadblock_cleared", () => fetchRoadblocks());
-    // ── Real-time driver location → update ambulance marker without refetch ──
+    // ── Real-time driver location → update the RIGHT ambulance marker,
+    // peu importe laquelle, sans tout refetch ────────────────────────────────
     socket.on("ambulance_location", (data: any) => {
       if (!vectorSourcesRef.current || activeMapMode !== "live") return;
-      if (data.ambulanceId !== selectedAmbulanceId) return;
+      const ambulanceId = data.ambulanceId;
+      if (ambulanceId == null) return;
       updateAmbulanceMarker(
+        ambulanceId,
         data.lat ?? data.latitude,
         data.lng ?? data.longitude,
       );
@@ -419,7 +458,7 @@ const MapModule: React.FC = () => {
       socket.emit("manager:offline");
       socket.disconnect();
     };
-  }, [refreshData, activeMapMode, selectedAmbulanceId]);
+  }, [refreshData, activeMapMode]);
 
   useEffect(() => {
     const poll = setInterval(() => {
@@ -434,21 +473,11 @@ const MapModule: React.FC = () => {
     fetchRoadblocks();
   }, []);
 
-  // ── Update ambulance marker in place (no re-fit) ──────────────────────────
-  const updateAmbulanceMarker = (lat: number, lng: number) => {
-    const sources = vectorSourcesRef.current;
-    if (!sources) return;
-    // Find existing ambulance marker in liveMarkers and move it
-    sources.liveMarkers.getFeatures().forEach((f) => {
-      if (f.get("isAmbulance")) {
-        (f.getGeometry() as Point).setCoordinates(fromLonLat([lng, lat]));
-      }
-    });
-  };
-
-  // ── Fetch live route — uses parsePgRoute (same as driver) ─────────────────
-  const fetchLiveRoute = useCallback(
-    async (ambulanceId: number) => {
+  // ── Fetch le trajet live d'UNE ambulance (retourne le résultat au lieu de
+  // faire un setState direct — permet de les paralléliser pour TOUTES les
+  // ambulances en mission) ──────────────────────────────────────────────────
+  const fetchLiveRouteForAmbulance = useCallback(
+    async (ambulanceId: number): Promise<LiveRoute | null> => {
       const token = localStorage.getItem("token");
       try {
         const activeIntervention = interventions.find(
@@ -458,20 +487,15 @@ const MapModule: React.FC = () => {
               i.statut,
             ),
         );
-        if (!activeIntervention) {
-          setLiveAmbulanceRoute(null);
-          return;
-        }
+        if (!activeIntervention) return null;
 
         const ambulance = ambulances.find((a) => a.id === ambulanceId);
         const ambulanceRes = await fetch(
           `${API_BASE_URL}/ambulances/${ambulanceId}`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-          },
+          { headers: { Authorization: `Bearer ${token}` } },
         );
         const ambulanceData = await ambulanceRes.json();
-        if (!ambulanceData.success || !ambulanceData.data) return;
+        if (!ambulanceData.success || !ambulanceData.data) return null;
 
         const isTransport = ["transport", "en_transport"].includes(
           activeIntervention.statut,
@@ -489,11 +513,9 @@ const MapModule: React.FC = () => {
           ? activeIntervention.hospital_name || "Hôpital"
           : `${activeIntervention.type} - ${activeIntervention.caller_name || "Urgence"}`;
 
-        // ── Driver's current position (source of truth) ───────────────────────
         const fromLat = ambulanceData.data.latitude as number;
         const fromLon = ambulanceData.data.longitude as number;
 
-        // ── Fetch route segments ──────────────────────────────────────────────
         const endpoint = isTransport
           ? `${API_BASE_URL}/mobile/driver/route-to-hospital/${activeIntervention.id}`
           : `${API_BASE_URL}/mobile/driver/route/${activeIntervention.id}`;
@@ -511,13 +533,10 @@ const MapModule: React.FC = () => {
           else if (Array.isArray(routeData.data)) segments = routeData.data;
 
           if (segments.length > 0) {
-            // ── KEY FIX: use parsePgRoute with REAL driver position ───────────
-            // This guarantees the manager sees the same path direction as driver
             routeCoords = parsePgRoute(segments, fromLat, fromLon);
           }
         }
 
-        // OSRM fallback if pgRouting gave nothing
         if (
           routeCoords.length < 2 &&
           destinationLat &&
@@ -534,14 +553,12 @@ const MapModule: React.FC = () => {
                 number,
                 number,
               ][];
-              // OSRM returns [lon,lat] — already correct
             }
           } catch {
             /* ignore */
           }
         }
 
-        // Straight-line last resort
         if (
           routeCoords.length < 2 &&
           fromLat &&
@@ -555,7 +572,6 @@ const MapModule: React.FC = () => {
           ];
         }
 
-        // ── ETA ───────────────────────────────────────────────────────────────
         let etaMinutes = 0,
           etaKm = 0;
         try {
@@ -585,7 +601,7 @@ const MapModule: React.FC = () => {
           etaMinutes = etaKm / 0.666;
         }
 
-        setLiveAmbulanceRoute({
+        return {
           route: routeCoords,
           ambulanceLocation: { lat: fromLat, lng: fromLon },
           destinationLocation: { lat: destinationLat, lng: destinationLon },
@@ -593,46 +609,62 @@ const MapModule: React.FC = () => {
           ambulanceLabel: ambulance?.immatriculation || `#${ambulanceId}`,
           destinationType,
           destinationName,
-        });
+        };
       } catch (e) {
-        console.error("fetchLiveRoute:", e);
+        console.error("fetchLiveRouteForAmbulance:", e);
+        return null;
       }
     },
     [interventions, ambulances],
   );
 
-  // ── Live polling ───────────────────────────────────────────────────────────
+  // ── FIX #4: récupère le trajet de TOUTES les ambulances en mission en
+  // parallèle, pour que chaque trajet dessiné côté driver apparaisse aussi,
+  // simultanément, sur la carte du manager ──────────────────────────────────
+  const fetchAllLiveRoutes = useCallback(async () => {
+    const ids = ambulances
+      .filter((a) =>
+        interventions.some(
+          (i) =>
+            i.ambulance_id === a.id &&
+            ["en route", "en attente", "transport", "en_transport"].includes(
+              i.statut,
+            ),
+        ),
+      )
+      .map((a) => a.id);
+
+    if (ids.length === 0) {
+      setLiveRoutes({});
+      return;
+    }
+
+    const results = await Promise.all(
+      ids.map(
+        async (id) => [id, await fetchLiveRouteForAmbulance(id)] as const,
+      ),
+    );
+    const next: Record<number, LiveRoute> = {};
+    for (const [id, r] of results) if (r) next[id] = r;
+    setLiveRoutes(next);
+  }, [ambulances, interventions, fetchLiveRouteForAmbulance]);
+
+  // ── Live polling — toutes les ambulances actives, pas une seule ──────────
   useEffect(() => {
     if (intervalRef.current) clearInterval(intervalRef.current);
-    if (activeMapMode === "live" && selectedAmbulanceId) {
-      const active = interventions.find(
-        (i) =>
-          i.ambulance_id === selectedAmbulanceId &&
-          ["en route", "en attente", "transport", "en_transport"].includes(
-            i.statut,
-          ),
-      );
-      if (!active) {
-        alert("Cette ambulance n'a pas de mission active.");
-        setActiveMapMode(null);
-        setSelectedAmbulanceId(null);
-        return;
-      }
+    if (activeMapMode === "live") {
       setLiveLoading(true);
-      fetchLiveRoute(selectedAmbulanceId).finally(() => setLiveLoading(false));
-      intervalRef.current = setInterval(
-        () => fetchLiveRoute(selectedAmbulanceId),
-        5000,
-      );
-    } else if (activeMapMode !== "live") {
-      setLiveAmbulanceRoute(null);
+      fetchAllLiveRoutes().finally(() => setLiveLoading(false));
+      intervalRef.current = setInterval(fetchAllLiveRoutes, 5000);
+    } else {
+      setLiveRoutes({});
       setSelectedAmbulanceId(null);
-      liveFitRef.current = { ambulanceId: null, destType: null };
+      hasFitAllRef.current = false;
     }
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [activeMapMode, selectedAmbulanceId, fetchLiveRoute, interventions]);
+  }, [activeMapMode, fetchAllLiveRoutes]);
 
   // ── Init map ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -668,6 +700,9 @@ const MapModule: React.FC = () => {
       if (feature && feature.get("roadblockData")) {
         zoomToRoadblock(feature.get("roadblockData"));
         setShowRoadblockPanel(true);
+      } else if (feature && feature.get("isAmbulance")) {
+        const id = feature.get("ambulanceId");
+        if (id != null) focusAmbulance(id);
       }
     });
     mapInstanceRef.current = map;
@@ -758,7 +793,8 @@ const MapModule: React.FC = () => {
     hideIcons,
   ]);
 
-  // ── Draw live route — only fit view on first load ─────────────────────────
+  // ── Draw ALL live routes simultaneously — ne recadre la vue qu'une fois,
+  // sur l'étendue combinée de TOUS les trajets actifs ───────────────────────
   useEffect(() => {
     const sources = vectorSourcesRef.current;
     const map = mapInstanceRef.current;
@@ -766,127 +802,160 @@ const MapModule: React.FC = () => {
 
     sources.liveRoute.clear();
     sources.liveMarkers.clear();
-    if (activeMapMode !== "live" || !liveAmbulanceRoute) return;
+    if (activeMapMode !== "live") return;
 
-    const {
-      route,
-      ambulanceLocation,
-      destinationLocation,
-      destinationType,
-      destinationName,
-    } = liveAmbulanceRoute;
-    const shouldFit =
-      liveFitRef.current.ambulanceId !== selectedAmbulanceId ||
-      liveFitRef.current.destType !== destinationType;
-    const routeColor = destinationType === "hospital" ? "#7c3aed" : "#2563eb";
-    const shadowColor =
-      destinationType === "hospital"
-        ? "rgba(124,58,237,0.15)"
-        : "rgba(37,99,235,0.15)";
+    const entries: [string, LiveRoute][] = Object.entries(liveRoutes);
+    if (entries.length === 0) return;
 
-    if (route && route.length >= 2) {
-      try {
-        const olCoords = route.map(([lon, lat]) => fromLonLat([lon, lat]));
-        const shadow = new Feature({ geometry: new LineString(olCoords) });
-        shadow.setStyle(
-          new Style({ stroke: new Stroke({ color: shadowColor, width: 14 }) }),
-        );
-        sources.liveRoute.addFeature(shadow);
-        const main = new Feature({ geometry: new LineString(olCoords) });
-        main.setStyle(
-          new Style({ stroke: new Stroke({ color: routeColor, width: 5 }) }),
-        );
-        sources.liveRoute.addFeature(main);
-        const dash = new Feature({ geometry: new LineString(olCoords) });
-        dash.setStyle(
-          new Style({
-            stroke: new Stroke({
-              color: "rgba(255,255,255,0.7)",
-              width: 2,
-              lineDash: [12, 10],
-            }),
-          }),
-        );
-        sources.liveRoute.addFeature(dash);
+    const allExtents: number[][] = [];
 
-        if (shouldFit) {
-          const extent = main.getGeometry()!.getExtent();
-          if (extent && extent.every((v) => !isNaN(v))) {
-            map.getView().fit(extent, {
-              padding: [60, 60, 60, 60],
-              maxZoom: 16,
-              duration: 800,
-            });
-          }
-          liveFitRef.current = {
-            ambulanceId: selectedAmbulanceId,
-            destType: destinationType,
-          };
-        }
-      } catch (e) {
-        console.error("draw live route:", e);
-      }
-    }
-
-    // ── Ambulance marker — tagged isAmbulance for real-time updates ──────────
-    if (ambulanceLocation?.lat && ambulanceLocation?.lng) {
-      const ambF = new Feature({
-        geometry: new Point(
-          fromLonLat([ambulanceLocation.lng, ambulanceLocation.lat]),
-        ),
-        isAmbulance: true,
-      });
-      ambF.setStyle(
-        new Style({
-          image: new Icon({
-            src: ICONS.ambulance,
-            anchor: [0.5, 1],
-            scale: 1.2,
-          }),
-          text: new Text({
-            text: liveAmbulanceRoute.ambulanceLabel,
-            offsetY: 14,
-            font: "bold 12px sans-serif",
-            fill: new Fill({ color: "#dc2626" }),
-            stroke: new Stroke({ color: "#fff", width: 3 }),
-          }),
-        }),
-      );
-      sources.liveMarkers.addFeature(ambF);
-    }
-
-    // Destination marker
-    if (destinationLocation?.lat && destinationLocation?.lng) {
-      const destIcon =
-        destinationType === "hospital" ? ICONS.hopital : ICONS.enRoute;
-      const destLabel =
+    entries.forEach(([idStr, lr]) => {
+      const ambulanceId = parseInt(idStr, 10);
+      const {
+        route,
+        ambulanceLocation,
+        destinationLocation,
+        destinationType,
+        destinationName,
+        ambulanceLabel,
+      } = lr;
+      const isFocused = selectedAmbulanceId === ambulanceId;
+      const routeColor = destinationType === "hospital" ? "#7c3aed" : "#2563eb";
+      const shadowColor =
         destinationType === "hospital"
-          ? `🏥 ${destinationName?.substring(0, 30) || "Hôpital"}`
-          : `🆘 ${destinationName?.substring(0, 30) || "Urgence"}`;
-      const destF = new Feature({
-        geometry: new Point(
-          fromLonLat([destinationLocation.lng, destinationLocation.lat]),
-        ),
-      });
-      destF.setStyle(
-        new Style({
-          image: new Icon({ src: destIcon, anchor: [0.5, 1], scale: 1.2 }),
-          text: new Text({
-            text: destLabel,
-            offsetY: 14,
-            font: "bold 11px sans-serif",
-            fill: new Fill({
-              color: destinationType === "hospital" ? "#059669" : "#ea580c",
+          ? "rgba(124,58,237,0.18)"
+          : "rgba(37,99,235,0.18)";
+
+      if (route && route.length >= 2) {
+        try {
+          const olCoords = route.map(([lon, lat]) => fromLonLat([lon, lat]));
+          const shadow = new Feature({ geometry: new LineString(olCoords) });
+          shadow.setStyle(
+            new Style({
+              stroke: new Stroke({
+                color: shadowColor,
+                width: isFocused ? 16 : 11,
+              }),
             }),
-            stroke: new Stroke({ color: "#fff", width: 3 }),
-            backgroundFill: new Fill({ color: "rgba(255,255,255,0.8)" }),
-            padding: [2, 4, 2, 4],
+          );
+          sources.liveRoute.addFeature(shadow);
+          const main = new Feature({ geometry: new LineString(olCoords) });
+          main.setStyle(
+            new Style({
+              stroke: new Stroke({
+                color: routeColor,
+                width: isFocused ? 6 : 4,
+                lineCap: "round",
+              }),
+            }),
+          );
+          sources.liveRoute.addFeature(main);
+          if (isFocused) {
+            const dash = new Feature({ geometry: new LineString(olCoords) });
+            dash.setStyle(
+              new Style({
+                stroke: new Stroke({
+                  color: "rgba(255,255,255,0.7)",
+                  width: 2,
+                  lineDash: [12, 10],
+                }),
+              }),
+            );
+            sources.liveRoute.addFeature(dash);
+          }
+          const extent = main.getGeometry()!.getExtent();
+          if (extent.every((v) => !isNaN(v) && isFinite(v)))
+            allExtents.push(extent);
+        } catch (e) {
+          console.error("draw live route:", e);
+        }
+      }
+
+      if (ambulanceLocation?.lat && ambulanceLocation?.lng) {
+        const ambF = new Feature({
+          geometry: new Point(
+            fromLonLat([ambulanceLocation.lng, ambulanceLocation.lat]),
+          ),
+          isAmbulance: true,
+          ambulanceId,
+        });
+        ambF.setStyle(
+          new Style({
+            image: new Icon({
+              src: ICONS.ambulance,
+              anchor: [0.5, 1],
+              scale: isFocused ? 1.3 : 1,
+            }),
+            text: new Text({
+              text: ambulanceLabel,
+              offsetY: 14,
+              font: isFocused ? "bold 13px sans-serif" : "bold 11px sans-serif",
+              fill: new Fill({ color: "#dc2626" }),
+              stroke: new Stroke({ color: "#fff", width: 3 }),
+            }),
           }),
-        }),
-      );
-      sources.liveMarkers.addFeature(destF);
+        );
+        sources.liveMarkers.addFeature(ambF);
+      }
+
+      if (destinationLocation?.lat && destinationLocation?.lng) {
+        const destIcon =
+          destinationType === "hospital" ? ICONS.hopital : ICONS.enRoute;
+        const destLabel =
+          destinationType === "hospital"
+            ? `🏥 ${destinationName?.substring(0, 24) || "Hôpital"}`
+            : `🆘 ${destinationName?.substring(0, 24) || "Urgence"}`;
+        const destF = new Feature({
+          geometry: new Point(
+            fromLonLat([destinationLocation.lng, destinationLocation.lat]),
+          ),
+        });
+        destF.setStyle(
+          new Style({
+            image: new Icon({
+              src: destIcon,
+              anchor: [0.5, 1],
+              scale: isFocused ? 1.2 : 1,
+            }),
+            text: new Text({
+              text: destLabel,
+              offsetY: 14,
+              font: "bold 10px sans-serif",
+              fill: new Fill({
+                color: destinationType === "hospital" ? "#059669" : "#ea580c",
+              }),
+              stroke: new Stroke({ color: "#fff", width: 3 }),
+              backgroundFill: new Fill({ color: "rgba(255,255,255,0.8)" }),
+              padding: [2, 4, 2, 4],
+            }),
+          }),
+        );
+        sources.liveMarkers.addFeature(destF);
+      }
+    });
+
+    // FIX #4: un seul cadrage automatique, sur l'étendue de TOUS les trajets
+    // actifs combinés — pas juste celui d'une ambulance sélectionnée.
+    if (!hasFitAllRef.current && allExtents.length > 0) {
+      let combined = allExtents[0].slice();
+      for (const ext of allExtents.slice(1)) {
+        combined = [
+          Math.min(combined[0], ext[0]),
+          Math.min(combined[1], ext[1]),
+          Math.max(combined[2], ext[2]),
+          Math.max(combined[3], ext[3]),
+        ];
+      }
+      if (combined.every((v) => !isNaN(v) && isFinite(v))) {
+        map.getView().fit(combined, {
+          padding: [70, 70, 70, 70],
+          maxZoom: 15,
+          duration: 800,
+        });
+      }
+      hasFitAllRef.current = true;
     }
-  }, [activeMapMode, liveAmbulanceRoute, selectedAmbulanceId]);
+  }, [activeMapMode, liveRoutes, selectedAmbulanceId]);
 
   const handleZoomIn = () =>
     mapInstanceRef.current
@@ -906,10 +975,12 @@ const MapModule: React.FC = () => {
     setLastRefresh(new Date());
   };
 
+  // FIX #4: "Live" affiche désormais TOUTES les ambulances en mission d'un
+  // coup — plus besoin de choisir une ambulance avant de voir quoi que ce
+  // soit ; le sélecteur ne sert plus qu'à "zoomer" sur l'une d'elles.
   const handleLiveClick = () => {
     if (activeMapMode === "live") {
       setActiveMapMode(null);
-      setShowAmbulancePicker(false);
       return;
     }
     if (ambulancesEnMission.length === 0) {
@@ -917,7 +988,6 @@ const MapModule: React.FC = () => {
       return;
     }
     setActiveMapMode("live");
-    setShowAmbulancePicker(true);
   };
 
   const activeCount = roadblocks.filter((r) => r.status === "active").length;
@@ -928,6 +998,8 @@ const MapModule: React.FC = () => {
           minute: "2-digit",
         })
       : "—";
+
+  const liveEntries: [string, LiveRoute][] = Object.entries(liveRoutes);
 
   return (
     <div className="map-module">
@@ -994,78 +1066,17 @@ const MapModule: React.FC = () => {
               )}
             </button>
           </div>
-          <div style={{ position: "relative" }}>
-            <button
-              className={`btn-tool ${activeMapMode === "live" ? "active-live" : ""}`}
-              onClick={handleLiveClick}
-              style={{ display: "flex", alignItems: "center", gap: 5 }}
-            >
-              {activeMapMode === "live" && <span className="live-dot" />}
-              <Activity size={13} /> Live
-              {ambulancesEnMission.length > 0 && (
-                <span className="badge">{ambulancesEnMission.length}</span>
-              )}
-              <ChevronDown size={11} />
-            </button>
-            {showAmbulancePicker && ambulancesEnMission.length > 0 && (
-              <div className="ambulance-picker">
-                <div className="picker-header">
-                  <span>Choisir l'ambulance</span>
-                  <button onClick={() => setShowAmbulancePicker(false)}>
-                    <X size={13} />
-                  </button>
-                </div>
-                {ambulancesEnMission.map((amb) => {
-                  const intervention = interventions.find(
-                    (i) =>
-                      i.ambulance_id === amb.id &&
-                      [
-                        "en route",
-                        "en attente",
-                        "transport",
-                        "en_transport",
-                      ].includes(i.statut),
-                  );
-                  const isTransport = ["transport", "en_transport"].includes(
-                    intervention?.statut || "",
-                  );
-                  return (
-                    <button
-                      key={amb.id}
-                      className={`picker-item ${selectedAmbulanceId === amb.id ? "selected" : ""}`}
-                      onClick={() => {
-                        setSelectedAmbulanceId(amb.id);
-                        setShowAmbulancePicker(false);
-                        liveFitRef.current = {
-                          ambulanceId: null,
-                          destType: null,
-                        };
-                      }}
-                    >
-                      <span className="picker-icon">🚑</span>
-                      <div className="picker-info">
-                        <div className="picker-plate">
-                          {amb.immatriculation}
-                        </div>
-                        {intervention && (
-                          <div className="picker-dest">
-                            {isTransport ? "🏥" : "🆘"} {intervention.type}
-                            {intervention.caller_name &&
-                              ` — ${intervention.caller_name}`}
-                          </div>
-                        )}
-                      </div>
-                      <span
-                        className={`picker-status ${isTransport ? "transport" : ""}`}
-                      >
-                        {isTransport ? "Transport" : "En route"}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
+          <button
+            className={`btn-tool ${activeMapMode === "live" ? "active-live" : ""}`}
+            onClick={handleLiveClick}
+            style={{ display: "flex", alignItems: "center", gap: 5 }}
+          >
+            {activeMapMode === "live" && <span className="live-dot" />}
+            <Activity size={13} /> Live — toutes les ambulances
+            {ambulancesEnMission.length > 0 && (
+              <span className="badge">{ambulancesEnMission.length}</span>
             )}
-          </div>
+          </button>
         </div>
 
         <div className="zoom-buttons">
@@ -1181,32 +1192,39 @@ const MapModule: React.FC = () => {
         </div>
       )}
 
-      {activeMapMode === "live" && liveAmbulanceRoute && (
-        <div
-          className={`live-bar ${liveAmbulanceRoute.destinationType === "hospital" ? "hospital-mode" : ""}`}
-        >
-          <span className="live-ambulance">
-            🚑 <strong>{liveAmbulanceRoute.ambulanceLabel}</strong>
-          </span>
-          <span className="live-destination">
-            {liveAmbulanceRoute.destinationType === "hospital" ? "🏥" : "🆘"}
-            <strong>
-              {liveAmbulanceRoute.destinationName?.substring(0, 30)}
-            </strong>
-          </span>
-          <span className="live-eta">
-            ⏱️ ETA:{" "}
-            <strong>{Math.round(liveAmbulanceRoute.eta.minutes)} min</strong>
-          </span>
-          <span className="live-distance">
-            📏 <strong>{liveAmbulanceRoute.eta.km.toFixed(1)} km</strong>
-          </span>
-          <button
-            className="live-change-btn"
-            onClick={() => setShowAmbulancePicker(true)}
-          >
-            Changer <ChevronDown size={11} />
-          </button>
+      {/* FIX #4: bandeau "live" affichant TOUTES les ambulances actives,
+          chacune cliquable pour zoomer/mettre en avant son trajet ───────── */}
+      {activeMapMode === "live" && (
+        <div className="live-bar-multi">
+          {liveLoading && liveEntries.length === 0 ? (
+            <span className="live-empty">Chargement des trajets...</span>
+          ) : liveEntries.length === 0 ? (
+            <span className="live-empty">
+              Aucun trajet actif pour le moment
+            </span>
+          ) : (
+            liveEntries.map(([idStr, lr]) => {
+              const id = parseInt(idStr, 10);
+              const isFocused = selectedAmbulanceId === id;
+              return (
+                <button
+                  key={id}
+                  className={`live-chip ${lr.destinationType === "hospital" ? "hospital" : ""} ${isFocused ? "focused" : ""}`}
+                  onClick={() => focusAmbulance(id)}
+                  title="Cliquer pour zoomer sur cette ambulance"
+                >
+                  <span className="live-chip-icon">🚑</span>
+                  <span className="live-chip-plate">{lr.ambulanceLabel}</span>
+                  <span className="live-chip-dest">
+                    {lr.destinationType === "hospital" ? "🏥" : "🆘"}
+                  </span>
+                  <span className="live-chip-eta">
+                    {Math.round(lr.eta.minutes)} min
+                  </span>
+                </button>
+              );
+            })
+          )}
         </div>
       )}
 
@@ -1276,25 +1294,16 @@ const MapModule: React.FC = () => {
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
         .btn-icon{padding:5px;border-radius:6px;cursor:pointer;border:1px solid #e2e8f0;background:white;color:#475569;display:inline-flex;align-items:center;transition:all .2s}
         .btn-icon:hover{background:#f1f5f9}
-        .ambulance-picker{position:absolute;top:calc(100% + 6px);right:0;z-index:1000;background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.15);border:1px solid #e2e8f0;min-width:300px;overflow:hidden}
-        .picker-header{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:12px;font-weight:600;color:#475569}
-        .picker-header button{background:none;border:none;cursor:pointer;color:#94a3b8;display:flex}
-        .picker-item{width:100%;display:flex;align-items:center;gap:10px;padding:10px 13px;border:none;background:white;cursor:pointer;border-bottom:1px solid #f1f5f9;transition:background .15s;text-align:left}
-        .picker-item:hover{background:#f8fafc}
-        .picker-item.selected{background:#eff6ff}
-        .picker-icon{font-size:22px}
-        .picker-info{flex:1}
-        .picker-plate{font-size:13px;font-weight:700;color:#1e293b}
-        .picker-dest{font-size:11px;color:#64748b;margin-top:2px}
-        .picker-status{font-size:10px;background:#fef3c7;color:#92400e;padding:2px 7px;border-radius:10px;font-weight:600;white-space:nowrap}
-        .picker-status.transport{background:#e9d5ff;color:#6b21a5}
-        .live-bar{display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding:10px 16px;background:#1e40af;border-radius:10px;margin-bottom:12px;color:white;font-size:13px}
-        .live-bar.hospital-mode{background:#6d28d9}
-        .live-ambulance{display:flex;align-items:center;gap:6px}
-        .live-destination{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.2);padding:4px 10px;border-radius:20px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-        .live-eta,.live-distance{display:flex;align-items:center;gap:4px}
-        .live-change-btn{background:rgba(255,255,255,.2);border:none;color:white;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:4px;margin-left:auto}
-        .live-change-btn:hover{background:rgba(255,255,255,.3)}
+        .live-bar-multi{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;background:#0f172a;border-radius:12px;margin-bottom:12px;align-items:center}
+        .live-empty{color:#94a3b8;font-size:12px;padding:4px 8px}
+        .live-chip{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.08);border:1.5px solid rgba(56,189,248,0.25);color:#e2e8f0;border-radius:20px;padding:6px 12px;font-size:12px;cursor:pointer;transition:all .15s}
+        .live-chip:hover{background:rgba(255,255,255,0.14)}
+        .live-chip.hospital{border-color:rgba(167,139,250,0.35)}
+        .live-chip.focused{background:#2563eb;border-color:#38bdf8;box-shadow:0 0 0 2px rgba(56,189,248,0.3)}
+        .live-chip.focused.hospital{background:#7c3aed;border-color:#a78bfa}
+        .live-chip-plate{font-weight:700}
+        .live-chip-eta{color:#93c5fd;font-weight:600}
+        .live-chip.focused .live-chip-eta{color:#dbeafe}
         .roadblock-panel{position:absolute;bottom:20px;right:20px;width:380px;background:white;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.15);border:1px solid #e2e8f0;z-index:1000;max-height:500px;display:flex;flex-direction:column;overflow:hidden}
         .panel-header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
         .panel-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;color:#1e293b}
@@ -1332,7 +1341,7 @@ const MapModule: React.FC = () => {
         .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:#475569}
         .legend-dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
         .legend-line{width:20px;height:4px;border-radius:2px;display:inline-block}
-        @media(max-width:768px){.controls-section{flex-direction:column}.roadblock-panel{width:calc(100% - 40px);right:20px;left:20px;bottom:20px}.live-bar{flex-direction:column;align-items:flex-start}.live-change-btn{margin-left:0}.live-destination{max-width:100%;overflow:visible;white-space:normal}}
+        @media(max-width:768px){.controls-section{flex-direction:column}.roadblock-panel{width:calc(100% - 40px);right:20px;left:20px;bottom:20px}.live-bar-multi{overflow-x:auto;flex-wrap:nowrap}}
       `}</style>
     </div>
   );

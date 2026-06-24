@@ -341,7 +341,11 @@ class RoutingService {
 
       let query;
       if (hasBumps) {
-        // Penalise each speed bump heavily (100 units) + real dynamic time cost
+        // FIX: détection des dos-d'âne par PROXIMITÉ SPATIALE (ST_DWithin),
+        // pas seulement par edge_id — beaucoup de speed_bumps n'ont pas
+        // edge_id renseigné dans la table (seulement lat/lon/location).
+        // Sans ce fallback spatial, le chemin "confort" ne détectait quasiment
+        // aucun dos-d'âne et roulait dessus comme le chemin "rapide".
         query = `
           SELECT a.seq, a.node, a.edge, a.cost, a.agg_cost,
                  ST_AsGeoJSON(
@@ -350,9 +354,17 @@ class RoutingService {
                  ) AS geometry
           FROM pgr_dijkstra(
             'SELECT w.gid::bigint AS id, w.source::bigint, w.target::bigint,
-                    COALESCE((SELECT COUNT(*)::float FROM speed_bumps sb WHERE sb.edge_id = w.gid), 0) * 100.0
+                    COALESCE((
+                      SELECT COUNT(*)::float FROM speed_bumps sb
+                      WHERE sb.edge_id = w.gid
+                         OR (sb.location IS NOT NULL AND ST_DWithin(sb.location::geography, w.the_geom::geography, 15))
+                    ), 0) * 150.0
                       + (ST_Length(w.the_geom::geography) / (COALESCE(w.maxspeed_forward,40)*1000.0/3600.0)) AS cost,
-                    COALESCE((SELECT COUNT(*)::float FROM speed_bumps sb WHERE sb.edge_id = w.gid), 0) * 100.0
+                    COALESCE((
+                      SELECT COUNT(*)::float FROM speed_bumps sb
+                      WHERE sb.edge_id = w.gid
+                         OR (sb.location IS NOT NULL AND ST_DWithin(sb.location::geography, w.the_geom::geography, 15))
+                    ), 0) * 150.0
                       + (ST_Length(w.the_geom::geography) / (COALESCE(w.maxspeed_backward,w.maxspeed_forward,40)*1000.0/3600.0)) AS reverse_cost
              FROM ways w
              WHERE w.source IS NOT NULL ${blockedClause}',
@@ -390,13 +402,17 @@ class RoutingService {
         );
       }
 
-      // Count bumps on selected path
+      // Count bumps on selected path (edge_id match OU proximité spatiale)
       const edgeIds = result.rows.map((r) => r.edge).filter((id) => id !== -1);
       let totalBumps = 0;
       if (edgeIds.length > 0 && hasBumps) {
         try {
           const bc = await pool.query(
-            `SELECT COUNT(*) AS total FROM speed_bumps WHERE edge_id = ANY($1::bigint[])`,
+            `SELECT COUNT(DISTINCT sb.id) AS total
+             FROM speed_bumps sb
+             JOIN ways w ON w.gid = ANY($1::bigint[])
+             WHERE sb.edge_id = w.gid
+                OR (sb.location IS NOT NULL AND ST_DWithin(sb.location::geography, w.the_geom::geography, 15))`,
             [edgeIds],
           );
           totalBumps = parseInt(bc.rows[0]?.total || 0);

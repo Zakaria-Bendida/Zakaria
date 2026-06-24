@@ -14,8 +14,10 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import routingService from "../services/routingService.js";
 
-// ── Helper: recalcule le trajet SOS en évitant les obstacles actifs ────────
-// FIX: utilise désormais l'algo de base (pas fastest avec facteur horaire)
+// ── Helper: recalcule le trajet (SOS ou hôpital selon la phase) en évitant
+// les obstacles actifs. FIX: directed=true pour respecter le sens de
+// circulation (avant: directed=false faisait ignorer les rues à sens unique,
+// d'où "le path choisit la rue inversée").
 async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
   const ambulance = await pool.query(
     "SELECT latitude, longitude FROM ambulances WHERE id = $1",
@@ -34,7 +36,7 @@ async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
   return routingService.getBasePathAvoidingBlocked(
     startVertex.vertex_id,
     endVertex.vertex_id,
-    false,
+    true,
   );
 }
 
@@ -160,15 +162,16 @@ class DriverController {
         );
         if (ambVertex.success && destVertex.success) {
           // FIX: algo de base (pas getPathAvoidingEdges/fastest) pour le trajet SOS
+          // directed=true pour respecter le sens de circulation
           const route = await routingService.getBasePathAvoidingBlocked(
             ambVertex.vertex_id,
             destVertex.vertex_id,
-            false,
+            true,
           );
           const etaResult = await routingService.calculateETAAdvanced(
             ambVertex.vertex_id,
             destVertex.vertex_id,
-            false,
+            true,
             true,
           );
           if (etaResult.success) eta = etaResult.data;
@@ -318,10 +321,11 @@ class DriverController {
           .json({ success: false, error: "Could not find route vertices" });
 
       // FIX: plus de branchement fastest/comfort ici — algo de base uniquement
+      // directed=true pour respecter le sens de circulation (rues à sens unique)
       const route = await routingService.getBasePathAvoidingBlocked(
         startVertex.vertex_id,
         endVertex.vertex_id,
-        false,
+        true,
       );
 
       res.json({
@@ -407,14 +411,14 @@ class DriverController {
         route = await routingService.getComfortPath(
           startVertex.vertex_id,
           endVertex.vertex_id,
-          false,
+          true,
         );
       } else {
         route = await routingService.getPathAvoidingEdges(
           startVertex.vertex_id,
           endVertex.vertex_id,
           [],
-          false,
+          true,
         );
       }
 
@@ -423,14 +427,14 @@ class DriverController {
         route = await routingService.getPathWithGeometry(
           startVertex.vertex_id,
           endVertex.vertex_id,
-          false,
+          true,
         );
       }
 
       const eta = await routingService.calculateETAAdvanced(
         startVertex.vertex_id,
         endVertex.vertex_id,
-        false,
+        true,
         true,
       );
 
@@ -559,14 +563,14 @@ class DriverController {
         route = await routingService.getComfortPath(
           startVertex.vertex_id,
           endVertex.vertex_id,
-          false,
+          true,
         );
       } else {
         route = await routingService.getPathAvoidingEdges(
           startVertex.vertex_id,
           endVertex.vertex_id,
           [],
-          false,
+          true,
         );
       }
 
@@ -575,14 +579,14 @@ class DriverController {
         route = await routingService.getPathWithGeometry(
           startVertex.vertex_id,
           endVertex.vertex_id,
-          false,
+          true,
         );
       }
 
       const eta = await routingService.calculateETAAdvanced(
         startVertex.vertex_id,
         endVertex.vertex_id,
-        false,
+        true,
         true,
       );
 
@@ -737,26 +741,39 @@ class DriverController {
         });
       }
 
-      // Get current intervention to notify driver of new route
+      // Get current intervention to notify driver of new route.
+      // FIX: récupère aussi hospital_id/lat/lon — si l'ambulance est déjà en
+      // "transport" (vers l'hôpital), il faut recalculer VERS L'HÔPITAL, pas
+      // vers le point SOS (avant: on recalculait toujours vers le SOS même
+      // pendant le transport, ce qui n'avait aucun sens).
       const intervention = await pool.query(
-        `SELECT id, latitude_depart, longitude_depart
-         FROM interventions
-         WHERE ambulance_id = $1 AND statut IN ('en route', 'transport', 'sur_place')
+        `SELECT i.id, i.statut, i.latitude_depart, i.longitude_depart,
+                h.latitude AS hospital_lat, h.longitude AS hospital_lon
+         FROM interventions i
+         LEFT JOIN hopitaux h ON i.hospital_id = h.id
+         WHERE i.ambulance_id = $1 AND i.statut IN ('en route', 'transport', 'sur_place')
          LIMIT 1`,
         [ambulanceId],
       );
 
       if (intervention.rows.length) {
+        const iv = intervention.rows[0];
+        const isTransport =
+          iv.statut === "transport" && iv.hospital_lat && iv.hospital_lon;
+        const destLat = isTransport ? iv.hospital_lat : iv.latitude_depart;
+        const destLon = isTransport ? iv.hospital_lon : iv.longitude_depart;
+
         const newRoute = await recalculateRouteFunc(
           ambulanceId,
-          intervention.rows[0].latitude_depart,
-          intervention.rows[0].longitude_depart,
+          destLat,
+          destLon,
         );
 
         if (io) {
           io.to(`driver_${ambulanceId}`).emit("route_recalculated", {
-            interventionId: intervention.rows[0].id,
+            interventionId: iv.id,
             new_route: newRoute.data || [],
+            leg: isTransport ? "to_hospital" : "to_sos",
             message: "Roadblock detected. Route recalculated.",
           });
         }
