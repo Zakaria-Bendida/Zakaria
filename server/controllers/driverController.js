@@ -48,11 +48,17 @@ async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
 // ── Helper: recalcule le trajet hôpital avec le bon algo (fastest/comfort).
 // Utilisé UNIQUEMENT pour la phase to_hospital dans reportRoadblock.
 // directed=true pour respecter le sens de circulation.
+// newlyBlockedEdgeId : l'edge qui vient d'être inséré en DB — on le passe
+// explicitement à getPathAvoidingEdges pour le mode fastest, car le INSERT
+// peut ne pas encore être visible (timing DB) au moment du SELECT dans
+// getPathAvoidingEdges. Sans ça, fastest recalcule parfois le même chemin
+// qui passe encore par l'obstacle tout juste signalé.
 async function recalculateHospitalRouteFunc(
   ambulanceId,
   destLat,
   destLon,
   routeType,
+  newlyBlockedEdgeId,
 ) {
   const ambulance = await pool.query(
     "SELECT latitude, longitude FROM ambulances WHERE id = $1",
@@ -80,11 +86,14 @@ async function recalculateHospitalRouteFunc(
       true,
     );
   } else {
-    // fastest par défaut
+    // fastest — on passe l'edge nouvellement bloqué explicitement pour
+    // garantir son exclusion même si le INSERT n'est pas encore visible
+    // dans la transaction courante au moment du SELECT de getPathAvoidingEdges.
+    const extraBlocked = newlyBlockedEdgeId ? [newlyBlockedEdgeId] : [];
     route = await routingService.getPathAvoidingEdges(
       startVertex.vertex_id,
       endVertex.vertex_id,
-      [],
+      extraBlocked,
       true,
     );
   }
@@ -843,6 +852,7 @@ class DriverController {
             iv.hospital_lat,
             iv.hospital_lon,
             effectiveRouteType,
+            finalEdgeId, // garantit l'exclusion même si INSERT pas encore visible en DB
           );
         } else {
           // ── Phase SOS → algo de base (inchangé) ──────────────────────
