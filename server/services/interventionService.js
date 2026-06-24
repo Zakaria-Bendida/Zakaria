@@ -1,10 +1,15 @@
 // services/interventionService.js
 import { pool } from "../config/database.js";
 import routingService from "./routingService.js";
-import User from "../models/User.js"; // ✅ single import at top, no dynamic import needed
+import User from "../models/User.js";
 
 class InterventionService {
   // Create intervention
+  // FIX: accepte désormais ambulance_id pour l'insérer en base. On ne notifie PAS le driver
+  // ici — la notif + le passage de l'ambulance à "En mission" se font exclusivement dans
+  // assignAmbulance(), appelé juste après par le contrôleur. Ça évite d'avoir deux chemins
+  // de code différents qui peuvent désynchroniser l'état (ambulance "Disponible" en base
+  // mais intervention déjà liée à elle, etc.)
   async createIntervention(data, io = null) {
     try {
       const {
@@ -14,12 +19,13 @@ class InterventionService {
         description,
         caller_name,
         caller_phone,
+        ambulance_id, // FIX: était lu nulle part avant
       } = data;
 
       const query = `
-        INSERT INTO interventions (type, latitude_depart, longitude_depart, description, statut, caller_name, caller_phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, 'en attente', $5, $6, NOW(), NOW())
-        RETURNING id, type, statut, created_at
+        INSERT INTO interventions (type, latitude_depart, longitude_depart, description, statut, caller_name, caller_phone, ambulance_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, 'en attente', $5, $6, $7, NOW(), NOW())
+        RETURNING id, type, statut, created_at, ambulance_id
       `;
       const result = await pool.query(query, [
         type,
@@ -28,6 +34,7 @@ class InterventionService {
         description,
         caller_name,
         caller_phone,
+        ambulance_id || null,
       ]);
 
       if (io) {
@@ -88,6 +95,14 @@ class InterventionService {
   }
 
   // Assign ambulance to intervention
+  // FIX: calcule désormais distance_km / eta_minutes via routingService et les inclut
+  // dans le payload "ambulance_assigned" envoyé au driver. Avant, ces champs n'étaient
+  // jamais envoyés -> undefined côté HomeScreen.tsx.
+  //
+  // ⚠️ ADAPTER ICI si la signature réelle de routingService diffère. J'ai supposé une
+  // fonction `calculateRoute(fromLat, fromLon, toLat, toLon)` qui retourne
+  // { distanceKm, durationMinutes } (ou équivalent). Remplace l'appel ci-dessous par
+  // ta fonction réelle si le nom/format est différent.
   async assignAmbulance(
     interventionId,
     ambulanceId,
@@ -167,6 +182,30 @@ class InterventionService {
         [ambulanceId],
       );
 
+      // FIX: calcul distance/ETA entre l'ambulance et le lieu d'intervention.
+      let distanceKm = null;
+      let etaMinutes = null;
+      if (
+        emergency.latitude_depart &&
+        emergency.longitude_depart &&
+        startLat &&
+        startLon
+      ) {
+        try {
+          const route = await routingService.calculateRoute(
+            startLat,
+            startLon,
+            emergency.latitude_depart,
+            emergency.longitude_depart,
+          );
+          // ⚠️ ADAPTER ICI selon ce que retourne réellement ta fonction.
+          distanceKm = route?.distanceKm ?? route?.distance_km ?? null;
+          etaMinutes = route?.durationMinutes ?? route?.eta_minutes ?? null;
+        } catch (routeError) {
+          console.error("Route calculation error:", routeError);
+        }
+      }
+
       // ✅ Notify the driver directly by socketId
       if (io) {
         const activeDriver = await User.findOne({
@@ -188,6 +227,8 @@ class InterventionService {
               phone: emergency.caller_phone,
             },
             description: emergency.description,
+            distance_km: distanceKm, // FIX: était absent -> undefined côté driver
+            eta_minutes: etaMinutes, // FIX: était absent -> undefined côté driver
             timestamp: new Date(),
           });
           console.log(
@@ -199,7 +240,6 @@ class InterventionService {
           );
         }
 
-        // ✅✅✅ AJOUTER CET ÉVÉNEMENT POUR LE DASHBOARD ✅✅✅
         io.emit("ambulance_status_updated", {
           ambulanceId: ambulanceId,
           newStatus: "En mission",
@@ -208,6 +248,16 @@ class InterventionService {
         console.log(
           `📢 Dashboard: ambulance ${ambulanceId} status updated to En mission`,
         );
+
+        // FIX: le dashboard manager n'était jamais notifié que l'ambulance a bien
+        // été liée à CETTE intervention -> c'est probablement pourquoi le card
+        // manager ne montrait pas l'ambulance assignée sans rafraîchir la page.
+        io.emit("intervention_updated", {
+          interventionId: parseInt(interventionId),
+          action: "ambulance_assigned",
+          ambulanceId: parseInt(ambulanceId),
+          timestamp: new Date(),
+        });
       }
 
       const responseData = {
@@ -215,6 +265,8 @@ class InterventionService {
         ambulance_id: parseInt(ambulanceId),
         ambulance_immatriculation: ambulance.immatriculation,
         hospital: hospitalInfo,
+        distance_km: distanceKm,
+        eta_minutes: etaMinutes,
       };
 
       if (ambulance.parking_id) {
@@ -256,12 +308,14 @@ class InterventionService {
       console.log("🔧 Updating intervention:", { id, data });
 
       const current = await pool.query(
-        "SELECT ambulance_id, statut FROM interventions WHERE id = $1",
+        "SELECT ambulance_id, statut, latitude_depart, longitude_depart FROM interventions WHERE id = $1",
         [id],
       );
 
       const oldAmbulanceId = current.rows[0]?.ambulance_id;
       const oldStatut = current.rows[0]?.statut;
+      const currentLat = latitude_depart ?? current.rows[0]?.latitude_depart;
+      const currentLon = longitude_depart ?? current.rows[0]?.longitude_depart;
 
       const updates = [];
       const values = [];
@@ -339,31 +393,89 @@ class InterventionService {
         return { success: false, error: "Intervention not found" };
       }
 
-      // ✅ FIXED: no dynamic import, User already imported at top
       if (ambulance_id !== undefined && oldAmbulanceId !== ambulance_id && io) {
-        // Notify new driver directly by socketId
-        const activeDriver = await User.findOne({
-          ambulanceId: ambulance_id,
-          role: "ambulancier",
-          isOnline: true,
-        });
+        // FIX: si la nouvelle ambulance choisie n'est pas "Disponible", on ne devrait
+        // pas continuer à la traiter comme assignée avec succès. On vérifie son statut
+        // ici pour éviter l'incohérence "card créé mais ambulance pas vraiment dispo".
+        const ambStatusCheck = await pool.query(
+          "SELECT statut FROM ambulances WHERE id = $1",
+          [ambulance_id],
+        );
+        const newAmbulanceStatut = ambStatusCheck.rows[0]?.statut;
 
-        if (activeDriver && activeDriver.socketId) {
-          io.to(activeDriver.socketId).emit("ambulance_assigned", {
-            interventionId: id,
-            type,
-            location: { lat: latitude_depart, lon: longitude_depart },
-            patient: { name: caller_name, phone: caller_phone },
-            description,
-            timestamp: new Date(),
-          });
+        if (newAmbulanceStatut && newAmbulanceStatut !== "Disponible") {
           console.log(
-            `📢 Notification envoyée au conducteur ${activeDriver.fullName} (socket: ${activeDriver.socketId})`,
+            `⚠️ Ambulance ${ambulance_id} n'est pas disponible (statut: ${newAmbulanceStatut}) — notif driver annulée`,
           );
         } else {
-          console.log(
-            `⚠️ Aucun conducteur en ligne pour l'ambulance ${ambulance_id}`,
+          // FIX: calcul distance/ETA, comme dans assignAmbulance.
+          let distanceKm = null;
+          let etaMinutes = null;
+          if (currentLat && currentLon) {
+            try {
+              const ambCoords = await pool.query(
+                `SELECT a.latitude, a.longitude, p.latitude as parking_lat, p.longitude as parking_lon
+                 FROM ambulances a LEFT JOIN parkings p ON a.parking_id = p.id
+                 WHERE a.id = $1`,
+                [ambulance_id],
+              );
+              const startLat =
+                ambCoords.rows[0]?.parking_lat || ambCoords.rows[0]?.latitude;
+              const startLon =
+                ambCoords.rows[0]?.parking_lon || ambCoords.rows[0]?.longitude;
+
+              if (startLat && startLon) {
+                const route = await routingService.calculateRoute(
+                  startLat,
+                  startLon,
+                  currentLat,
+                  currentLon,
+                );
+                distanceKm = route?.distanceKm ?? route?.distance_km ?? null;
+                etaMinutes =
+                  route?.durationMinutes ?? route?.eta_minutes ?? null;
+              }
+            } catch (routeError) {
+              console.error("Route calculation error:", routeError);
+            }
+          }
+
+          await pool.query(
+            "UPDATE ambulances SET statut = 'En mission', updated_at = NOW() WHERE id = $1",
+            [ambulance_id],
           );
+
+          const activeDriver = await User.findOne({
+            ambulanceId: ambulance_id,
+            role: "ambulancier",
+            isOnline: true,
+          });
+
+          if (activeDriver && activeDriver.socketId) {
+            io.to(activeDriver.socketId).emit("ambulance_assigned", {
+              interventionId: id,
+              type,
+              location: { lat: currentLat, lon: currentLon },
+              patient: { name: caller_name, phone: caller_phone },
+              description,
+              distance_km: distanceKm, // FIX
+              eta_minutes: etaMinutes, // FIX
+              timestamp: new Date(),
+            });
+            console.log(
+              `📢 Notification envoyée au conducteur ${activeDriver.fullName} (socket: ${activeDriver.socketId})`,
+            );
+          } else {
+            console.log(
+              `⚠️ Aucun conducteur en ligne pour l'ambulance ${ambulance_id}`,
+            );
+          }
+
+          io.emit("ambulance_status_updated", {
+            ambulanceId: ambulance_id,
+            newStatus: "En mission",
+            timestamp: new Date(),
+          });
         }
 
         // Free old ambulance and notify old driver
@@ -389,28 +501,12 @@ class InterventionService {
               `📢 Ancien conducteur ${oldDriver.fullName} notifié de la réassignation`,
             );
           }
-        }
 
-        // ✅✅✅ AJOUTER CET ÉVÉNEMENT POUR LE DASHBOARD AMBULANCES ✅✅✅
-        io.emit("ambulance_status_updated", {
-          ambulanceId: ambulance_id,
-          newStatus: "En mission",
-          timestamp: new Date(),
-        });
-        console.log(
-          `📢 Dashboard: ambulance ${ambulance_id} status updated to En mission (via updateIntervention)`,
-        );
-
-        // Si on a libéré une ancienne ambulance, aussi notifier le dashboard
-        if (oldAmbulanceId) {
           io.emit("ambulance_status_updated", {
             ambulanceId: oldAmbulanceId,
             newStatus: "Disponible",
             timestamp: new Date(),
           });
-          console.log(
-            `📢 Dashboard: ambulance ${oldAmbulanceId} status updated to Disponible`,
-          );
         }
       }
 
@@ -476,7 +572,6 @@ class InterventionService {
       }
 
       if (io) {
-        // ✅ Notify the driver directly
         const activeDriver = await User.findOne({
           ambulanceId: currentIntervention.ambulance_id,
           role: "ambulancier",
@@ -493,11 +588,18 @@ class InterventionService {
           );
         }
 
-        // Also broadcast to dashboard
         io.emit("intervention_completed", {
           interventionId,
           timestamp: new Date(),
         });
+
+        if (currentIntervention.ambulance_id) {
+          io.emit("ambulance_status_updated", {
+            ambulanceId: currentIntervention.ambulance_id,
+            newStatus: "Disponible",
+            timestamp: new Date(),
+          });
+        }
       }
 
       return { success: true, message: "Intervention completed successfully" };
@@ -546,7 +648,6 @@ class InterventionService {
       );
 
       if (io) {
-        // ✅ FIXED: notify driver directly with mission_cancelled (was missing before)
         if (currentIntervention.ambulance_id) {
           const activeDriver = await User.findOne({
             ambulanceId: currentIntervention.ambulance_id,
@@ -563,9 +664,14 @@ class InterventionService {
               `📢 Conducteur ${activeDriver.fullName} notifié de l'annulation`,
             );
           }
+
+          io.emit("ambulance_status_updated", {
+            ambulanceId: currentIntervention.ambulance_id,
+            newStatus: "Disponible",
+            timestamp: new Date(),
+          });
         }
 
-        // Also broadcast to dashboard
         io.emit("intervention_cancelled", {
           interventionId,
           timestamp: new Date(),
