@@ -172,10 +172,23 @@ const MapModule: React.FC = () => {
   const socketRef = useRef<any>(null);
   // Ne recadrer la vue qu'une seule fois (sur l'ensemble des trajets actifs)
   const hasFitAllRef = useRef(false);
+  // FIX #2: mémorise le dernier routeType (fastest/comfort) connu par
+  // ambulance — appris via le relais socket "driver_route_update" ou la
+  // réponse de l'endpoint hôpital — pour que le polling de secours
+  // redemande le MÊME type que celui réellement affiché chez le driver.
+  const lastKnownRouteTypeRef = useRef<Record<number, string>>({});
 
   const { ambulances, parkings, hopitaux, interventions, refreshData } =
     useData();
   const sidiBelAbbesCenter = fromLonLat([-0.6298, 35.1919]);
+
+  // FIX #2: accès toujours à jour à la liste des ambulances depuis le
+  // handler socket (qui ne dépend pas de [ambulances] pour rester stable) —
+  // déclaré APRÈS useData() pour que `ambulances` existe déjà.
+  const ambulancesRef = useRef(ambulances);
+  useEffect(() => {
+    ambulancesRef.current = ambulances;
+  }, [ambulances]);
 
   const activeInterventions = interventions.filter((i) =>
     ["en route", "en attente", "transport", "en_transport"].includes(i.statut),
@@ -450,6 +463,53 @@ const MapModule: React.FC = () => {
         data.lng ?? data.longitude,
       );
     });
+    // ── FIX #2: relais EXACT du trajet calculé côté driver. On ne recalcule
+    // RIEN ici — on parse et affiche directement les MÊMES données que
+    // celles que le driver a affichées sur son propre écran. C'est la seule
+    // façon de garantir une correspondance à 100% (même algorithme, même
+    // position de départ, même routeType, même destination).
+    socket.on("driver_route_update", (data: any) => {
+      if (activeMapMode !== "live") return;
+      const ambulanceId = data.ambulanceId;
+      if (ambulanceId == null || !Array.isArray(data.route)) return;
+
+      const ambPos = data.ambulancePos || {};
+      const fromLat = Number(ambPos.lat);
+      const fromLon = Number(ambPos.lon);
+      const routeCoords = parsePgRoute(data.route, fromLat, fromLon);
+      if (routeCoords.length < 2) return;
+
+      const destinationType: "intervention" | "hospital" =
+        data.leg === "to_hospital" ? "hospital" : "intervention";
+
+      if (data.routeType)
+        lastKnownRouteTypeRef.current[ambulanceId] = data.routeType;
+
+      const amb = ambulancesRef.current.find((a) => a.id === ambulanceId);
+
+      setLiveRoutes((prev) => ({
+        ...prev,
+        [ambulanceId]: {
+          route: routeCoords,
+          ambulanceLocation: { lat: fromLat, lng: fromLon },
+          destinationLocation: {
+            lat: Number(data.destination?.lat) || 0,
+            lng: Number(data.destination?.lon) || 0,
+          },
+          eta:
+            prev[ambulanceId]?.eta ||
+            (data.eta
+              ? { minutes: data.eta.total_minutes, km: data.eta.total_km }
+              : { minutes: 0, km: 0 }),
+          ambulanceLabel: amb?.immatriculation || `#${ambulanceId}`,
+          destinationType,
+          destinationName:
+            data.destination?.name ||
+            prev[ambulanceId]?.destinationName ||
+            (destinationType === "hospital" ? "Hôpital" : "Urgence"),
+        },
+      }));
+    });
     socket.emit("manager:online", {
       managerId: "manager",
       managerName: "Manager",
@@ -500,27 +560,30 @@ const MapModule: React.FC = () => {
         const isTransport = ["transport", "en_transport"].includes(
           activeIntervention.statut,
         );
-        const destinationLat = isTransport
-          ? activeIntervention.hospital_lat
-          : activeIntervention.latitude_depart;
-        const destinationLon = isTransport
-          ? activeIntervention.hospital_lon
-          : activeIntervention.longitude_depart;
         const destinationType = isTransport
           ? "hospital"
           : ("intervention" as const);
-        const destinationName = isTransport
-          ? activeIntervention.hospital_name || "Hôpital"
-          : `${activeIntervention.type} - ${activeIntervention.caller_name || "Urgence"}`;
 
         const fromLat = ambulanceData.data.latitude as number;
         const fromLon = ambulanceData.data.longitude as number;
 
+        // FIX #2 (bug A — le trajet hôpital ne s'affichait pas du tout) :
+        // on n'utilise plus activeIntervention.hospital_lat/lon/name, qui
+        // peuvent être absents de la liste générique des interventions
+        // (champs venant d'une JOINTURE non garantie côté backend). On
+        // récupère désormais la destination DIRECTEMENT depuis la réponse
+        // de l'endpoint route — exactement comme le fait l'app driver.
+        const lastType =
+          lastKnownRouteTypeRef.current[ambulanceId] || "fastest";
         const endpoint = isTransport
-          ? `${API_BASE_URL}/mobile/driver/route-to-hospital/${activeIntervention.id}`
+          ? `${API_BASE_URL}/mobile/driver/route-to-hospital/${activeIntervention.id}?routeType=${lastType}`
           : `${API_BASE_URL}/mobile/driver/route/${activeIntervention.id}`;
 
         let routeCoords: [number, number][] = [];
+        let destinationLat: number | null = null;
+        let destinationLon: number | null = null;
+        let destinationName: string | undefined;
+
         const routeRes = await fetch(endpoint, {
           headers: { Authorization: `Bearer ${token}` },
         });
@@ -535,6 +598,35 @@ const MapModule: React.FC = () => {
           if (segments.length > 0) {
             routeCoords = parsePgRoute(segments, fromLat, fromLon);
           }
+
+          if (isTransport && routeData.data.hospital) {
+            destinationLat = Number(routeData.data.hospital.lat);
+            destinationLon = Number(routeData.data.hospital.lon);
+            destinationName = routeData.data.hospital.name || "Hôpital";
+            if (routeData.data.routeType)
+              lastKnownRouteTypeRef.current[ambulanceId] =
+                routeData.data.routeType;
+          } else if (!isTransport && routeData.data.destination) {
+            destinationLat = Number(routeData.data.destination.lat);
+            destinationLon = Number(routeData.data.destination.lon);
+          }
+        }
+
+        // Fallback : destination toujours absente → on retombe sur les
+        // coordonnées brutes de l'intervention (latitude_depart existe
+        // directement sur la table interventions, donc fiable)
+        if (destinationLat == null || destinationLon == null) {
+          destinationLat = isTransport
+            ? Number(activeIntervention.hospital_lat) || null
+            : Number(activeIntervention.latitude_depart);
+          destinationLon = isTransport
+            ? Number(activeIntervention.hospital_lon) || null
+            : Number(activeIntervention.longitude_depart);
+        }
+        if (!destinationName) {
+          destinationName = isTransport
+            ? activeIntervention.hospital_name || "Hôpital"
+            : `${activeIntervention.type} - ${activeIntervention.caller_name || "Urgence"}`;
         }
 
         if (
@@ -589,22 +681,27 @@ const MapModule: React.FC = () => {
             }
           }
         } catch {
-          const R = 6371;
-          const dLat = ((destinationLat - fromLat) * Math.PI) / 180;
-          const dLon = ((destinationLon - fromLon) * Math.PI) / 180;
-          const a =
-            Math.sin(dLat / 2) ** 2 +
-            Math.cos((fromLat * Math.PI) / 180) *
-              Math.cos((destinationLat * Math.PI) / 180) *
-              Math.sin(dLon / 2) ** 2;
-          etaKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-          etaMinutes = etaKm / 0.666;
+          if (destinationLat && destinationLon) {
+            const R = 6371;
+            const dLat = ((destinationLat - fromLat) * Math.PI) / 180;
+            const dLon = ((destinationLon - fromLon) * Math.PI) / 180;
+            const a =
+              Math.sin(dLat / 2) ** 2 +
+              Math.cos((fromLat * Math.PI) / 180) *
+                Math.cos((destinationLat * Math.PI) / 180) *
+                Math.sin(dLon / 2) ** 2;
+            etaKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            etaMinutes = etaKm / 0.666;
+          }
         }
 
         return {
           route: routeCoords,
           ambulanceLocation: { lat: fromLat, lng: fromLon },
-          destinationLocation: { lat: destinationLat, lng: destinationLon },
+          destinationLocation: {
+            lat: destinationLat || 0,
+            lng: destinationLon || 0,
+          },
           eta: { minutes: etaMinutes, km: etaKm },
           ambulanceLabel: ambulance?.immatriculation || `#${ambulanceId}`,
           destinationType,

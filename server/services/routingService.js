@@ -209,8 +209,32 @@ class RoutingService {
       ]);
 
       if (!result.rows?.length) {
+        // FIX #1: si la version "directed" (respect du sens de circulation)
+        // ne trouve aucun chemin une fois l'obstacle exclu (le réseau peut
+        // être mal connecté dans ce sens précis), on retente SANS cette
+        // contrainte — en gardant TOUJOURS l'exclusion de l'obstacle actif.
+        // Avant ce fix, on tombait directement sur getPathWithGeometry qui
+        // IGNORE complètement les obstacles → le chemin ne se redessinait
+        // jamais autour de la rue signalée.
+        if (directed) {
+          console.warn(
+            "⚠️ Aucun trajet de base (directed), nouvelle tentative sans contrainte de sens (obstacles toujours évités)",
+          );
+          const retryResult = await pool.query(query, [
+            startVertexId,
+            endVertexId,
+            false,
+          ]);
+          if (retryResult.rows?.length) {
+            return {
+              success: true,
+              data: retryResult.rows,
+              meta: { blockedEdges: dbBlocked, relaxedDirection: true },
+            };
+          }
+        }
         console.warn(
-          "⚠️ Aucun trajet de base trouvé, fallback géométrie simple",
+          "⚠️ Aucun trajet de base trouvé, fallback géométrie simple (obstacles ignorés)",
         );
         return this.getPathWithGeometry(startVertexId, endVertexId, directed);
       }
@@ -288,7 +312,38 @@ class RoutingService {
       ]);
 
       if (!result.rows?.length) {
-        console.warn("⚠️ No fastest route found, fallback to base path");
+        // FIX #1: même garde-fou que getBasePathAvoidingBlocked — avant de
+        // tout abandonner (et donc d'ignorer l'obstacle signalé), on retente
+        // sans la contrainte stricte de sens de circulation, en conservant
+        // l'exclusion de l'edge bloqué.
+        if (directed) {
+          console.warn(
+            "⚠️ Aucun trajet rapide (directed), nouvelle tentative sans contrainte de sens (obstacles toujours évités)",
+          );
+          const retryResult = await pool.query(query, [
+            startVertexId,
+            endVertexId,
+            false,
+          ]);
+          if (retryResult.rows?.length) {
+            const turnPenaltyRetry = await this.calculateTurnPenaltiesForRoute(
+              retryResult.rows,
+            );
+            return {
+              success: true,
+              data: retryResult.rows,
+              meta: {
+                timeFactor,
+                turnPenaltySeconds: Math.round(turnPenaltyRetry),
+                blockedEdges: allBlocked,
+                relaxedDirection: true,
+              },
+            };
+          }
+        }
+        console.warn(
+          "⚠️ No fastest route found, fallback to base path (obstacles ignorés)",
+        );
         return this.getPathWithGeometry(startVertexId, endVertexId, directed);
       }
 
@@ -393,6 +448,50 @@ class RoutingService {
       ]);
 
       if (!result.rows?.length) {
+        // FIX #1: avant de complètement abandonner le confort pour basculer
+        // sur "fastest", on retente le confort SANS la contrainte stricte de
+        // sens de circulation — toujours en excluant l'obstacle actif.
+        if (directed) {
+          console.warn(
+            "⚠️ Aucun trajet confort (directed), nouvelle tentative sans contrainte de sens",
+          );
+          const retryResult = await pool.query(query, [
+            startVertexId,
+            endVertexId,
+            false,
+          ]);
+          if (retryResult.rows?.length) {
+            const edgeIdsRetry = retryResult.rows
+              .map((r) => r.edge)
+              .filter((id) => id !== -1);
+            let totalBumpsRetry = 0;
+            if (edgeIdsRetry.length > 0 && hasBumps) {
+              try {
+                const bcRetry = await pool.query(
+                  `SELECT COUNT(DISTINCT sb.id) AS total
+                   FROM speed_bumps sb
+                   JOIN ways w ON w.gid = ANY($1::bigint[])
+                   WHERE sb.edge_id = w.gid
+                      OR (sb.location IS NOT NULL AND ST_DWithin(sb.location::geography, w.the_geom::geography, 15))`,
+                  [edgeIdsRetry],
+                );
+                totalBumpsRetry = parseInt(bcRetry.rows[0]?.total || 0);
+              } catch {
+                /* ignore */
+              }
+            }
+            return {
+              success: true,
+              data: retryResult.rows,
+              meta: {
+                routeType: "comfort",
+                totalBumpsOnPath: totalBumpsRetry,
+                blockedEdges: dbBlocked,
+                relaxedDirection: true,
+              },
+            };
+          }
+        }
         console.warn("⚠️ No comfort route found, fallback to fastest");
         return this.getPathAvoidingEdges(
           startVertexId,
