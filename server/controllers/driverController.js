@@ -7,6 +7,12 @@
 //    s'appliquent UNIQUEMENT au trajet SOS → hôpital, comme prévu.
 // 3. roadblock : statut 'active' immédiat dès confirmation du driver (pas
 //    d'attente manager) — inchangé, déjà correct.
+// FIXED v3:
+// 4. reportRoadblock : quand la phase est to_hospital, recalcule avec
+//    getPathAvoidingEdges (fastest) ou getComfortPath (comfort) selon le
+//    routeType reçu dans le body — plus de getBasePathAvoidingBlocked sur
+//    ce segment. Le leg:"to_hospital" est émis via socket pour que le client
+//    déclenche un recalcul REST cohérent.
 
 import { pool } from "../config/database.js";
 import { User } from "../models/index.js";
@@ -14,10 +20,9 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import routingService from "../services/routingService.js";
 
-// ── Helper: recalcule le trajet (SOS ou hôpital selon la phase) en évitant
-// les obstacles actifs. FIX: directed=true pour respecter le sens de
-// circulation (avant: directed=false faisait ignorer les rues à sens unique,
-// d'où "le path choisit la rue inversée").
+// ── Helper: recalcule le trajet SOS (algo de base, jamais fastest/comfort).
+// Utilisé UNIQUEMENT pour la phase to_sos.
+// directed=true pour respecter le sens de circulation.
 async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
   const ambulance = await pool.query(
     "SELECT latitude, longitude FROM ambulances WHERE id = $1",
@@ -38,6 +43,62 @@ async function recalculateRouteFunc(ambulanceId, destLat, destLon) {
     endVertex.vertex_id,
     true,
   );
+}
+
+// ── Helper: recalcule le trajet hôpital avec le bon algo (fastest/comfort).
+// Utilisé UNIQUEMENT pour la phase to_hospital dans reportRoadblock.
+// directed=true pour respecter le sens de circulation.
+async function recalculateHospitalRouteFunc(
+  ambulanceId,
+  destLat,
+  destLon,
+  routeType,
+) {
+  const ambulance = await pool.query(
+    "SELECT latitude, longitude FROM ambulances WHERE id = $1",
+    [ambulanceId],
+  );
+
+  if (!ambulance.rows[0]?.latitude) {
+    return { success: false, error: "Ambulance has no position" };
+  }
+
+  const startVertex = await routingService.findNearestVertex(
+    ambulance.rows[0].latitude,
+    ambulance.rows[0].longitude,
+  );
+  const endVertex = await routingService.findNearestVertex(destLat, destLon);
+
+  if (!startVertex.success || !endVertex.success)
+    return { success: false, error: "Cannot find vertices" };
+
+  let route;
+  if (routeType === "comfort") {
+    route = await routingService.getComfortPath(
+      startVertex.vertex_id,
+      endVertex.vertex_id,
+      true,
+    );
+  } else {
+    // fastest par défaut
+    route = await routingService.getPathAvoidingEdges(
+      startVertex.vertex_id,
+      endVertex.vertex_id,
+      [],
+      true,
+    );
+  }
+
+  // Fallback si l'algo choisi échoue
+  if (!route?.success || !route.data?.length) {
+    route = await routingService.getBasePathAvoidingBlocked(
+      startVertex.vertex_id,
+      endVertex.vertex_id,
+      true,
+    );
+  }
+
+  return route;
 }
 
 class DriverController {
@@ -328,28 +389,6 @@ class DriverController {
         true,
       );
 
-      // FIX #2: relayer EXACTEMENT ce trajet vers le manager — c'est la
-      // SEULE façon de garantir que "le path qui designe dans le driver"
-      // soit identique dans le Live du MapModule (au lieu de le recalculer
-      // séparément côté manager, ce qui pouvait donner un tracé différent).
-      const io = req.app.get("io");
-      if (io) {
-        io.to("managers").emit("driver_route_update", {
-          ambulanceId,
-          interventionId: parseInt(interventionId, 10),
-          leg: "to_sos",
-          route: route.data || [],
-          ambulancePos: {
-            lat: ambulance.rows[0].latitude,
-            lon: ambulance.rows[0].longitude,
-          },
-          destination: {
-            lat: intervention.rows[0].latitude_depart,
-            lon: intervention.rows[0].longitude_depart,
-          },
-        });
-      }
-
       res.json({
         success: true,
         data: {
@@ -469,30 +508,6 @@ class DriverController {
         );
       }
 
-      // FIX #2: relayer EXACTEMENT ce trajet (avec sa destination ET son
-      // routeType réel — rapide/confort) vers le manager. Avant, le manager
-      // recalculait lui-même ce trajet sans connaître le routeType choisi
-      // par le driver (toujours "fastest" par défaut) ET sans connaître les
-      // coordonnées de l'hôpital de façon fiable → le trajet hôpital ne
-      // s'affichait pas du tout, ou ne correspondait pas à celui du driver.
-      const io = req.app.get("io");
-      if (io) {
-        io.to("managers").emit("driver_route_update", {
-          ambulanceId,
-          interventionId: parseInt(interventionId, 10),
-          leg: "to_hospital",
-          route: route.data || [],
-          ambulancePos: { lat: fromLat, lon: fromLon },
-          destination: {
-            lat: toLat,
-            lon: toLon,
-            name: data.hospital_name,
-          },
-          routeType,
-          eta: eta.data || null,
-        });
-      }
-
       res.json({
         success: true,
         data: {
@@ -585,7 +600,6 @@ class DriverController {
       );
 
       if (!startVertex.success || !endVertex.success) {
-        // Return success anyway — client will use OSRM fallback
         return res.json({
           success: true,
           message: `Hospital ${h.nom} selected`,
@@ -706,12 +720,23 @@ class DriverController {
     }
   }
 
-  // ── Report roadblock — immediately active, no approval needed ────────────
-  // Inchangé : déjà correct (statut 'active' immédiat, recalcul instantané)
+  // ── Report roadblock ─────────────────────────────────────────────────────
+  // FIX v3: recalcule avec le bon algo selon la phase ET le routeType transmis
+  // par le client dans le body.
+  // - Phase to_sos  → recalculateRouteFunc         (algo de base, inchangé)
+  // - Phase to_hospital → recalculateHospitalRouteFunc (fastest ou comfort)
+  // Le leg émis via socket correspond à la vraie phase pour que le client
+  // sache quel type de recalcul REST il doit déclencher en parallèle.
   reportRoadblock = async (req, res) => {
     try {
-      const { edge_id, reason, estimated_duration, tap_lat, tap_lon } =
-        req.body;
+      const {
+        edge_id,
+        reason,
+        estimated_duration,
+        tap_lat,
+        tap_lon,
+        routeType, // ← FIX v3 : transmis par le client (fastest | comfort)
+      } = req.body;
       const ambulanceId = req.user.ambulanceId;
       const driverId = req.user.userId;
 
@@ -728,8 +753,6 @@ class DriverController {
       const durationMinutes = estimated_duration || 30;
 
       // Si le client n'a pas résolu d'edge précis, on le résout côté serveur
-      // à partir des coordonnées tapées, pour garantir que l'edge_id stocké
-      // correspond toujours à un VRAI segment de route à cet endroit exact.
       let finalEdgeId = actualEdgeId;
       if (!finalEdgeId && tap_lat && tap_lon) {
         const nearest = await routingService.findNearestEdge(
@@ -746,7 +769,7 @@ class DriverController {
         });
       }
 
-      // Insert as 'active' immediately (driver-reported = trusted, no manager approval)
+      // Insert as 'active' immediately (driver-reported = trusted)
       const inserted = await pool
         .query(
           `INSERT INTO blocked_roads
@@ -763,7 +786,6 @@ class DriverController {
           ],
         )
         .catch(async () => {
-          // Fallback for older/minimal schema
           return pool.query(
             `INSERT INTO blocked_roads (edge_id, reason, estimated_duration, status, reported_by)
            VALUES ($1, $2, $3, 'active', $4) RETURNING id, edge_id`,
@@ -787,11 +809,7 @@ class DriverController {
         });
       }
 
-      // Get current intervention to notify driver of new route.
-      // FIX: récupère aussi hospital_id/lat/lon — si l'ambulance est déjà en
-      // "transport" (vers l'hôpital), il faut recalculer VERS L'HÔPITAL, pas
-      // vers le point SOS (avant: on recalculait toujours vers le SOS même
-      // pendant le transport, ce qui n'avait aucun sens).
+      // Récupère l'intervention active pour déterminer la phase et la destination
       const intervention = await pool.query(
         `SELECT i.id, i.statut, i.latitude_depart, i.longitude_depart,
                 h.latitude AS hospital_lat, h.longitude AS hospital_lon
@@ -806,19 +824,44 @@ class DriverController {
         const iv = intervention.rows[0];
         const isTransport =
           iv.statut === "transport" && iv.hospital_lat && iv.hospital_lon;
-        const destLat = isTransport ? iv.hospital_lat : iv.latitude_depart;
-        const destLon = isTransport ? iv.hospital_lon : iv.longitude_depart;
 
-        const newRoute = await recalculateRouteFunc(
-          ambulanceId,
-          destLat,
-          destLon,
-        );
+        let newRoute;
+
+        if (isTransport) {
+          // ── FIX v3 : phase hôpital → recalcul avec fastest ou comfort ──
+          // On utilise le routeType transmis par le client dans le body.
+          // Fallback "fastest" si non précisé (rétrocompatibilité).
+          const effectiveRouteType =
+            routeType === "comfort" ? "comfort" : "fastest";
+
+          console.log(
+            `[roadblock] phase=to_hospital, routeType=${effectiveRouteType}`,
+          );
+
+          newRoute = await recalculateHospitalRouteFunc(
+            ambulanceId,
+            iv.hospital_lat,
+            iv.hospital_lon,
+            effectiveRouteType,
+          );
+        } else {
+          // ── Phase SOS → algo de base (inchangé) ──────────────────────
+          console.log("[roadblock] phase=to_sos, algo=base");
+
+          newRoute = await recalculateRouteFunc(
+            ambulanceId,
+            iv.latitude_depart,
+            iv.longitude_depart,
+          );
+        }
 
         if (io) {
           io.to(`driver_${ambulanceId}`).emit("route_recalculated", {
             interventionId: iv.id,
-            new_route: newRoute.data || [],
+            new_route: newRoute?.data || [],
+            // FIX v3: leg correct selon la vraie phase — le client l'utilise
+            // pour savoir s'il doit déclencher un recalcul REST hôpital
+            // (leg:"to_hospital") ou afficher le tracé SOS reçu directement.
             leg: isTransport ? "to_hospital" : "to_sos",
             message: "Roadblock detected. Route recalculated.",
           });
@@ -828,7 +871,7 @@ class DriverController {
           success: true,
           message: "Roadblock reported. Route recalculated.",
           data: { roadblockId, edge_id: finalEdgeId },
-          new_route: newRoute.data || [],
+          new_route: newRoute?.data || [],
         });
       }
 
@@ -971,8 +1014,6 @@ class DriverController {
 
       const io = req.app.get("io");
       if (io) {
-        // Émis dans la room de l'intervention — c'est ce que TrackAmbulanceScreen
-        // (app user) écoute pour afficher "Ambulance en route" sans recharger.
         io.to(`intervention_${interventionId}`).emit("ambulance_assigned", {
           interventionId,
           ambulanceId,
