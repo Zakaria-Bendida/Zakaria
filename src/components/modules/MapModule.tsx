@@ -1,3 +1,38 @@
+// src/modules/MapModule.tsx
+// FIX #2 / #4 (récap historique, voir commentaires inline du fichier original)
+// FIX v5 (CE PATCH) :
+// Contexte du bug signalé : en mode "Live", la carte manager devait montrer
+// EXACTEMENT le même tracé que celui affiché côté driver, peu importe la
+// phase (SOS->ambulance OU ambulance->hôpital) et peu importe l'algo
+// (algo de base pour SOS, fastest/comfort pour hôpital). Avant ce patch :
+//   - le socket "driver_route_update" était écouté côté client mais n'était
+//     JAMAIS émis côté serveur (event mort) -> le manager dépendait à 100%
+//     du polling REST (fetchAllLiveRoutes, toutes les 5s)
+//   - ce polling REST recalculait lui-même un tracé en rappelant les mêmes
+//     endpoints que le driver, mais à un instant différent et avec un état
+//     "lastKnownRouteTypeRef" qui pouvait être vide/obsolète au moment où
+//     l'ambulance vient de basculer en phase hôpital -> tracé manquant ou
+//     erroné pendant quelques cycles de polling, surtout pour la phase SOS
+//     (le polling list "to_sos" peut rater si aucune route_geometry n'a
+//     encore été renvoyée par /mobile/driver/route/:id)
+// Ce patch suppose que le serveur (driverController.js) a été corrigé en
+// parallèle pour RÉELLEMENT émettre "driver_route_update" vers la room
+// "managers" à chaque calcul de tracé driver (getCurrentAssignment, getRoute,
+// getRouteToHospital, selectHospitalAndRoute, reportRoadblock). Avec ce
+// serveur corrigé, ce composant :
+//   1. Traite "driver_route_update" comme la source de vérité PRINCIPALE en
+//      Live : dès qu'un event arrive pour une ambulance, son tracé/destination
+//      sont mis à jour immédiatement, avec le bon "leg" (to_sos/to_hospital)
+//      et le bon "routeType" (null/fastest/comfort) — exactement ce que le
+//      driver a sous les yeux, sans recalcul séparé côté manager.
+//   2. Garde le polling REST (fetchAllLiveRoutes) comme FALLBACK uniquement,
+//      pour couvrir le cas où aucun socket n'est encore arrivé pour une
+//      ambulance donnée (ex: le manager vient d'activer "Live" alors qu'un
+//      driver est déjà en mission depuis longtemps et qu'aucun nouvel event
+//      ne sera émis avant son prochain mouvement/recalcul). On ne touche PAS
+//      à un tracé déjà reçu par socket: on ne remplace l'entrée socket par du
+//      polling QUE si elle n'existe pas encore.
+
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Map, View } from "ol";
 import { Tile as TileLayer, Vector as VectorLayer } from "ol/layer";
@@ -62,6 +97,10 @@ interface LiveRoute {
   ambulanceLabel: string;
   destinationType: "intervention" | "hospital";
   destinationName?: string;
+  // FIX v5: trace l'origine de la donnée pour ne jamais laisser le polling
+  // REST écraser une entrée plus fraîche reçue par socket.
+  source: "socket" | "rest";
+  updatedAt: number;
 }
 
 interface Roadblock {
@@ -158,9 +197,11 @@ const MapModule: React.FC = () => {
   const [loadingRoadblocks, setLoadingRoadblocks] = useState(false);
   const [refreshingRoadblocks, setRefreshingRoadblocks] = useState(false);
 
-  // FIX #4: liveRoutes contient désormais TOUTES les ambulances en mission
-  // (clé = ambulanceId), plus une seule à la fois — chaque trajet dessiné
-  // côté driver doit aussi apparaître ici, simultanément.
+  // FIX #4 (historique) + FIX v5 (ce patch): liveRoutes contient TOUTES les
+  // ambulances en mission (clé = ambulanceId). Chaque entrée porte
+  // maintenant `source` ("socket" | "rest") et `updatedAt`, pour que le
+  // polling REST de fallback ne puisse jamais écraser une donnée plus
+  // récente reçue par socket.
   const [liveRoutes, setLiveRoutes] = useState<Record<number, LiveRoute>>({});
   const [selectedAmbulanceId, setSelectedAmbulanceId] = useState<number | null>(
     null,
@@ -172,19 +213,21 @@ const MapModule: React.FC = () => {
   const socketRef = useRef<any>(null);
   // Ne recadrer la vue qu'une seule fois (sur l'ensemble des trajets actifs)
   const hasFitAllRef = useRef(false);
-  // FIX #2: mémorise le dernier routeType (fastest/comfort) connu par
-  // ambulance — appris via le relais socket "driver_route_update" ou la
-  // réponse de l'endpoint hôpital — pour que le polling de secours
-  // redemande le MÊME type que celui réellement affiché chez le driver.
+  // FIX #2 (historique): mémorise le dernier routeType (fastest/comfort)
+  // connu par ambulance — utilisé par le polling REST de fallback pour
+  // redemander le même type que celui réellement affiché chez le driver,
+  // appris soit via le relais socket "driver_route_update" (FIX v5, fiable
+  // car c'est le serveur qui le précise directement), soit via la réponse
+  // de l'endpoint hôpital lors d'un polling précédent.
   const lastKnownRouteTypeRef = useRef<Record<number, string>>({});
 
   const { ambulances, parkings, hopitaux, interventions, refreshData } =
     useData();
   const sidiBelAbbesCenter = fromLonLat([-0.6298, 35.1919]);
 
-  // FIX #2: accès toujours à jour à la liste des ambulances depuis le
-  // handler socket (qui ne dépend pas de [ambulances] pour rester stable) —
-  // déclaré APRÈS useData() pour que `ambulances` existe déjà.
+  // FIX #2 (historique): accès toujours à jour à la liste des ambulances
+  // depuis le handler socket (qui ne dépend pas de [ambulances] pour rester
+  // stable) — déclaré APRÈS useData() pour que `ambulances` existe déjà.
   const ambulancesRef = useRef(ambulances);
   useEffect(() => {
     ambulancesRef.current = ambulances;
@@ -463,11 +506,21 @@ const MapModule: React.FC = () => {
         data.lng ?? data.longitude,
       );
     });
-    // ── FIX #2: relais EXACT du trajet calculé côté driver. On ne recalcule
-    // RIEN ici — on parse et affiche directement les MÊMES données que
-    // celles que le driver a affichées sur son propre écran. C'est la seule
-    // façon de garantir une correspondance à 100% (même algorithme, même
-    // position de départ, même routeType, même destination).
+    // ── FIX v5 (anciennement FIX #2) : relais EXACT du trajet calculé côté
+    // driver. Le serveur (driverController.js corrigé) émet maintenant
+    // RÉELLEMENT cet event à chaque calcul de tracé driver — que ce soit la
+    // phase SOS (algo de base) ou la phase hôpital (fastest/comfort), et à
+    // chaque recalcul après obstacle. On ne recalcule RIEN ici — on parse et
+    // affiche directement les MÊMES données que celles que le driver a
+    // affichées sur son propre écran. C'est la seule façon de garantir une
+    // correspondance à 100% (même algorithme, même position de départ,
+    // même routeType, même destination), peu importe la phase ou l'algo.
+    //
+    // Cet event est désormais la source de vérité PRIORITAIRE: il marque
+    // l'entrée comme `source:"socket"` avec un `updatedAt` frais, ce qui
+    // empêche le polling REST de fallback (fetchAllLiveRoutes) de
+    // l'écraser avec une donnée recalculée séparément et potentiellement
+    // différente.
     socket.on("driver_route_update", (data: any) => {
       if (activeMapMode !== "live") return;
       const ambulanceId = data.ambulanceId;
@@ -482,6 +535,11 @@ const MapModule: React.FC = () => {
       const destinationType: "intervention" | "hospital" =
         data.leg === "to_hospital" ? "hospital" : "intervention";
 
+      // FIX v5: routeType est `null` pour la phase SOS (algo de base, par
+      // design jamais fastest/comfort) — on ne mémorise donc que les
+      // valeurs non-nulles, pour ne pas effacer le dernier routeType
+      // hôpital connu quand l'ambulance repasse en phase SOS pour une
+      // mission ultérieure.
       if (data.routeType)
         lastKnownRouteTypeRef.current[ambulanceId] = data.routeType;
 
@@ -496,17 +554,17 @@ const MapModule: React.FC = () => {
             lat: Number(data.destination?.lat) || 0,
             lng: Number(data.destination?.lon) || 0,
           },
-          eta:
-            prev[ambulanceId]?.eta ||
-            (data.eta
-              ? { minutes: data.eta.total_minutes, km: data.eta.total_km }
-              : { minutes: 0, km: 0 }),
+          eta: data.eta
+            ? { minutes: data.eta.total_minutes, km: data.eta.total_km }
+            : prev[ambulanceId]?.eta || { minutes: 0, km: 0 },
           ambulanceLabel: amb?.immatriculation || `#${ambulanceId}`,
           destinationType,
           destinationName:
             data.destination?.name ||
             prev[ambulanceId]?.destinationName ||
             (destinationType === "hospital" ? "Hôpital" : "Urgence"),
+          source: "socket",
+          updatedAt: Date.now(),
         },
       }));
     });
@@ -535,7 +593,9 @@ const MapModule: React.FC = () => {
 
   // ── Fetch le trajet live d'UNE ambulance (retourne le résultat au lieu de
   // faire un setState direct — permet de les paralléliser pour TOUTES les
-  // ambulances en mission) ──────────────────────────────────────────────────
+  // ambulances en mission). FIX v5: ceci reste un FALLBACK REST utilisé
+  // uniquement quand aucune donnée socket n'est encore disponible pour
+  // cette ambulance (voir fetchAllLiveRoutes ci-dessous) ───────────────────
   const fetchLiveRouteForAmbulance = useCallback(
     async (ambulanceId: number): Promise<LiveRoute | null> => {
       const token = localStorage.getItem("token");
@@ -567,12 +627,15 @@ const MapModule: React.FC = () => {
         const fromLat = ambulanceData.data.latitude as number;
         const fromLon = ambulanceData.data.longitude as number;
 
-        // FIX #2 (bug A — le trajet hôpital ne s'affichait pas du tout) :
-        // on n'utilise plus activeIntervention.hospital_lat/lon/name, qui
-        // peuvent être absents de la liste générique des interventions
-        // (champs venant d'une JOINTURE non garantie côté backend). On
-        // récupère désormais la destination DIRECTEMENT depuis la réponse
-        // de l'endpoint route — exactement comme le fait l'app driver.
+        // FIX #2 (historique, bug A — le trajet hôpital ne s'affichait pas
+        // du tout) : on n'utilise plus activeIntervention.hospital_lat/lon/
+        // name, qui peuvent être absents de la liste générique des
+        // interventions. On récupère désormais la destination DIRECTEMENT
+        // depuis la réponse de l'endpoint route — exactement comme le fait
+        // l'app driver. Ce GET déclenche AUSSI, côté serveur (driverController
+        // corrigé), l'émission de "driver_route_update" — donc même ce
+        // fallback REST finit par alimenter le même canal que le socket pour
+        // les prochains cycles.
         const lastType =
           lastKnownRouteTypeRef.current[ambulanceId] || "fastest";
         const endpoint = isTransport
@@ -706,6 +769,8 @@ const MapModule: React.FC = () => {
           ambulanceLabel: ambulance?.immatriculation || `#${ambulanceId}`,
           destinationType,
           destinationName,
+          source: "rest",
+          updatedAt: Date.now(),
         };
       } catch (e) {
         console.error("fetchLiveRouteForAmbulance:", e);
@@ -715,9 +780,16 @@ const MapModule: React.FC = () => {
     [interventions, ambulances],
   );
 
-  // ── FIX #4: récupère le trajet de TOUTES les ambulances en mission en
-  // parallèle, pour que chaque trajet dessiné côté driver apparaisse aussi,
-  // simultanément, sur la carte du manager ──────────────────────────────────
+  // ── FIX #4 (historique) + FIX v5 (ce patch) : récupère le trajet de
+  // TOUTES les ambulances en mission en parallèle — mais NE TOUCHE PAS aux
+  // ambulances qui ont déjà une entrée fraîche venant du socket
+  // (`source === "socket"` et reçue il y a moins de RECENT_SOCKET_MS). Ça
+  // évite que ce polling de fallback écrase un tracé fastest/comfort/SOS
+  // déjà correctement affiché par le push temps réel avec un recalcul REST
+  // séparé qui pourrait légèrement différer (timing, état des
+  // blocked_roads au moment exact du recalcul, etc).
+  const RECENT_SOCKET_MS = 8000;
+
   const fetchAllLiveRoutes = useCallback(async () => {
     const ids = ambulances
       .filter((a) =>
@@ -736,15 +808,50 @@ const MapModule: React.FC = () => {
       return;
     }
 
+    const now = Date.now();
+    const idsNeedingFallback = ids.filter((id) => {
+      const existing = liveRoutes[id];
+      if (!existing) return true;
+      if (existing.source !== "socket") return true;
+      return now - existing.updatedAt > RECENT_SOCKET_MS;
+    });
+
+    // Retire du state les ambulances qui ne sont plus en mission, mais
+    // conserve celles qui ont une entrée socket récente même si ce cycle de
+    // polling ne les revalide pas explicitement.
+    setLiveRoutes((prev) => {
+      const next: Record<number, LiveRoute> = {};
+      for (const id of ids) {
+        if (prev[id]) next[id] = prev[id];
+      }
+      return next;
+    });
+
+    if (idsNeedingFallback.length === 0) return;
+
     const results = await Promise.all(
-      ids.map(
+      idsNeedingFallback.map(
         async (id) => [id, await fetchLiveRouteForAmbulance(id)] as const,
       ),
     );
-    const next: Record<number, LiveRoute> = {};
-    for (const [id, r] of results) if (r) next[id] = r;
-    setLiveRoutes(next);
-  }, [ambulances, interventions, fetchLiveRouteForAmbulance]);
+    setLiveRoutes((prev) => {
+      const next = { ...prev };
+      for (const [id, r] of results) {
+        if (!r) continue;
+        // Re-vérification finale: si un event socket est arrivé PENDANT que
+        // ce fetch REST était en vol, on ne l'écrase pas.
+        const existing = next[id];
+        if (
+          existing?.source === "socket" &&
+          Date.now() - existing.updatedAt < RECENT_SOCKET_MS
+        ) {
+          continue;
+        }
+        next[id] = r;
+      }
+      return next;
+    });
+  }, [ambulances, interventions, fetchLiveRouteForAmbulance, liveRoutes]);
 
   // ── Live polling — toutes les ambulances actives, pas une seule ──────────
   useEffect(() => {
@@ -761,7 +868,8 @@ const MapModule: React.FC = () => {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [activeMapMode, fetchAllLiveRoutes]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeMapMode]);
 
   // ── Init map ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1031,8 +1139,9 @@ const MapModule: React.FC = () => {
       }
     });
 
-    // FIX #4: un seul cadrage automatique, sur l'étendue de TOUS les trajets
-    // actifs combinés — pas juste celui d'une ambulance sélectionnée.
+    // FIX #4 (historique): un seul cadrage automatique, sur l'étendue de
+    // TOUS les trajets actifs combinés — pas juste celui d'une ambulance
+    // sélectionnée.
     if (!hasFitAllRef.current && allExtents.length > 0) {
       let combined = allExtents[0].slice();
       for (const ext of allExtents.slice(1)) {
@@ -1072,9 +1181,10 @@ const MapModule: React.FC = () => {
     setLastRefresh(new Date());
   };
 
-  // FIX #4: "Live" affiche désormais TOUTES les ambulances en mission d'un
-  // coup — plus besoin de choisir une ambulance avant de voir quoi que ce
-  // soit ; le sélecteur ne sert plus qu'à "zoomer" sur l'une d'elles.
+  // FIX #4 (historique): "Live" affiche désormais TOUTES les ambulances en
+  // mission d'un coup — plus besoin de choisir une ambulance avant de voir
+  // quoi que ce soit ; le sélecteur ne sert plus qu'à "zoomer" sur l'une
+  // d'elles.
   const handleLiveClick = () => {
     if (activeMapMode === "live") {
       setActiveMapMode(null);
@@ -1289,8 +1399,9 @@ const MapModule: React.FC = () => {
         </div>
       )}
 
-      {/* FIX #4: bandeau "live" affichant TOUTES les ambulances actives,
-          chacune cliquable pour zoomer/mettre en avant son trajet ───────── */}
+      {/* FIX #4 (historique): bandeau "live" affichant TOUTES les
+          ambulances actives, chacune cliquable pour zoomer/mettre en avant
+          son trajet ──────────────────────────────────────────────────── */}
       {activeMapMode === "live" && (
         <div className="live-bar-multi">
           {liveLoading && liveEntries.length === 0 ? (
