@@ -3,6 +3,73 @@ import { pool } from "../config/database.js";
 import routingService from "./routingService.js";
 import User from "../models/User.js";
 
+const toNumber = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const haversineKm = (fromLat, fromLon, toLat, toLon) => {
+  const R = 6371;
+  const dLat = ((toLat - fromLat) * Math.PI) / 180;
+  const dLon = ((toLon - fromLon) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((fromLat * Math.PI) / 180) *
+      Math.cos((toLat * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+async function calculateAssignmentMetrics(fromLat, fromLon, toLat, toLon) {
+  const startLat = toNumber(fromLat);
+  const startLon = toNumber(fromLon);
+  const destLat = toNumber(toLat);
+  const destLon = toNumber(toLon);
+
+  if (
+    startLat == null ||
+    startLon == null ||
+    destLat == null ||
+    destLon == null
+  ) {
+    return { distanceKm: null, etaMinutes: null };
+  }
+
+  try {
+    const startVertex = await routingService.findNearestVertex(
+      startLat,
+      startLon,
+    );
+    const endVertex = await routingService.findNearestVertex(destLat, destLon);
+
+    if (startVertex.success && endVertex.success) {
+      const eta = await routingService.calculateETAAdvanced(
+        startVertex.vertex_id,
+        endVertex.vertex_id,
+        true,
+        true,
+      );
+
+      if (eta.success && eta.data) {
+        return {
+          distanceKm: eta.data.total_km ?? null,
+          etaMinutes: eta.data.total_minutes ?? null,
+        };
+      }
+    }
+  } catch (routeError) {
+    console.error("Route calculation error:", routeError);
+  }
+
+  const distanceKm = parseFloat(
+    haversineKm(startLat, startLon, destLat, destLon).toFixed(2),
+  );
+  return {
+    distanceKm,
+    etaMinutes: parseFloat(((distanceKm / 40) * 60).toFixed(1)),
+  };
+}
+
 class InterventionService {
   // Create intervention
   // FIX: accepte désormais ambulance_id pour l'insérer en base. On ne notifie PAS le driver
@@ -182,29 +249,12 @@ class InterventionService {
         [ambulanceId],
       );
 
-      // FIX: calcul distance/ETA entre l'ambulance et le lieu d'intervention.
-      let distanceKm = null;
-      let etaMinutes = null;
-      if (
-        emergency.latitude_depart &&
-        emergency.longitude_depart &&
-        startLat &&
-        startLon
-      ) {
-        try {
-          const route = await routingService.calculateRoute(
-            startLat,
-            startLon,
-            emergency.latitude_depart,
-            emergency.longitude_depart,
-          );
-          // ⚠️ ADAPTER ICI selon ce que retourne réellement ta fonction.
-          distanceKm = route?.distanceKm ?? route?.distance_km ?? null;
-          etaMinutes = route?.durationMinutes ?? route?.eta_minutes ?? null;
-        } catch (routeError) {
-          console.error("Route calculation error:", routeError);
-        }
-      }
+      const { distanceKm, etaMinutes } = await calculateAssignmentMetrics(
+        startLat,
+        startLon,
+        emergency.latitude_depart,
+        emergency.longitude_depart,
+      );
 
       // ✅ Notify the driver directly by socketId
       if (io) {
@@ -214,23 +264,30 @@ class InterventionService {
           isOnline: true,
         });
 
+        const assignmentPayload = {
+          interventionId,
+          type: emergency.type,
+          location: {
+            lat: emergency.latitude_depart,
+            lon: emergency.longitude_depart,
+          },
+          patient: {
+            name: emergency.caller_name,
+            phone: emergency.caller_phone,
+          },
+          description: emergency.description,
+          distance_km: distanceKm,
+          eta_minutes: etaMinutes,
+          timestamp: new Date(),
+        };
+
+        const target = io.to(`driver_${ambulanceId}`);
         if (activeDriver && activeDriver.socketId) {
-          io.to(activeDriver.socketId).emit("ambulance_assigned", {
-            interventionId,
-            type: emergency.type,
-            location: {
-              lat: emergency.latitude_depart,
-              lon: emergency.longitude_depart,
-            },
-            patient: {
-              name: emergency.caller_name,
-              phone: emergency.caller_phone,
-            },
-            description: emergency.description,
-            distance_km: distanceKm, // FIX: était absent -> undefined côté driver
-            eta_minutes: etaMinutes, // FIX: était absent -> undefined côté driver
-            timestamp: new Date(),
-          });
+          target.to(activeDriver.socketId);
+        }
+        target.emit("ambulance_assigned", assignmentPayload);
+
+        if (activeDriver && activeDriver.socketId) {
           console.log(
             `📢 Notification envoyée au conducteur ${activeDriver.fullName} (socket: ${activeDriver.socketId})`,
           );
@@ -408,7 +465,6 @@ class InterventionService {
             `⚠️ Ambulance ${ambulance_id} n'est pas disponible (statut: ${newAmbulanceStatut}) — notif driver annulée`,
           );
         } else {
-          // FIX: calcul distance/ETA, comme dans assignAmbulance.
           let distanceKm = null;
           let etaMinutes = null;
           if (currentLat && currentLon) {
@@ -425,15 +481,14 @@ class InterventionService {
                 ambCoords.rows[0]?.parking_lon || ambCoords.rows[0]?.longitude;
 
               if (startLat && startLon) {
-                const route = await routingService.calculateRoute(
+                const metrics = await calculateAssignmentMetrics(
                   startLat,
                   startLon,
                   currentLat,
                   currentLon,
                 );
-                distanceKm = route?.distanceKm ?? route?.distance_km ?? null;
-                etaMinutes =
-                  route?.durationMinutes ?? route?.eta_minutes ?? null;
+                distanceKm = metrics.distanceKm;
+                etaMinutes = metrics.etaMinutes;
               }
             } catch (routeError) {
               console.error("Route calculation error:", routeError);
@@ -451,17 +506,24 @@ class InterventionService {
             isOnline: true,
           });
 
+          const assignmentPayload = {
+            interventionId: id,
+            type,
+            location: { lat: currentLat, lon: currentLon },
+            patient: { name: caller_name, phone: caller_phone },
+            description,
+            distance_km: distanceKm,
+            eta_minutes: etaMinutes,
+            timestamp: new Date(),
+          };
+
+          const target = io.to(`driver_${ambulance_id}`);
           if (activeDriver && activeDriver.socketId) {
-            io.to(activeDriver.socketId).emit("ambulance_assigned", {
-              interventionId: id,
-              type,
-              location: { lat: currentLat, lon: currentLon },
-              patient: { name: caller_name, phone: caller_phone },
-              description,
-              distance_km: distanceKm, // FIX
-              eta_minutes: etaMinutes, // FIX
-              timestamp: new Date(),
-            });
+            target.to(activeDriver.socketId);
+          }
+          target.emit("ambulance_assigned", assignmentPayload);
+
+          if (activeDriver && activeDriver.socketId) {
             console.log(
               `📢 Notification envoyée au conducteur ${activeDriver.fullName} (socket: ${activeDriver.socketId})`,
             );
