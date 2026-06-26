@@ -273,8 +273,8 @@ class RoutingService {
           'SELECT gid::bigint AS id, source::bigint, target::bigint,
                   (ST_Length(the_geom::geography) / (COALESCE(maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS cost,
                   (ST_Length(the_geom::geography) / (COALESCE(maxspeed_backward,maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS reverse_cost
-           FROM ways
-           WHERE source IS NOT NULL ${blockedClause}',
+           FROM ways w
+           WHERE w.source IS NOT NULL ${blockedClause}',
           $1::bigint, $2::bigint, $3::boolean
         ) a
         JOIN ways w ON a.edge = w.gid
@@ -288,8 +288,14 @@ class RoutingService {
       ]);
 
       if (!result.rows?.length) {
-        console.warn("⚠️ No fastest route found, fallback to base path");
-        return this.getPathWithGeometry(startVertexId, endVertexId, directed);
+        console.warn(
+          "⚠️ No fastest route found, fallback to base path avoiding blocked roads",
+        );
+        return this.getBasePathAvoidingBlocked(
+          startVertexId,
+          endVertexId,
+          directed,
+        );
       }
 
       const turnPenalty = await this.calculateTurnPenaltiesForRoute(
@@ -306,7 +312,11 @@ class RoutingService {
       };
     } catch (error) {
       console.error("Path avoiding edges error:", error);
-      return this.getPathWithGeometry(startVertexId, endVertexId, directed);
+      return this.getBasePathAvoidingBlocked(
+        startVertexId,
+        endVertexId,
+        directed,
+      );
     }
   }
 
