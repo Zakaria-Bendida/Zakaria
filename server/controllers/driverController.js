@@ -1105,17 +1105,6 @@ class DriverController {
   };
 
   // ── Get all roadblocks (manager view) ───────────────────────────────────
-  // FIX v5: un obstacle 'active' reste affiché TANT QUE le manager ne l'a
-  // pas explicitement dégagé (clic "Dégager" -> clearRoadblock), peu
-  // importe expires_at. Avant ce patch, la clause
-  // "WHERE br.expires_at > NOW() OR br.status = 'cleared'" faisait
-  // disparaître silencieusement tout obstacle 'active' dont le délai
-  // estimé (estimated_duration, ~30 min par défaut) était dépassé — même
-  // si le manager n'avait jamais cliqué "Dégager". C'est ce qui causait la
-  // disparition apparente des obstacles signalés après un certain temps.
-  // Désormais : tous les obstacles 'active' sont toujours renvoyés ; seuls
-  // les obstacles 'cleared' sont limités aux 24 dernières heures (pour ne
-  // pas accumuler un historique infini de vieux obstacles déjà résolus).
   async getRoadblocks(req, res) {
     try {
       const result = await pool.query(
@@ -1125,10 +1114,9 @@ class DriverController {
                 a.immatriculation AS reported_by_ambulance
          FROM blocked_roads br
          LEFT JOIN ambulances a ON br.reported_by = a.id
-         WHERE br.status = 'active'
-            OR (br.status = 'cleared' AND br.cleared_at > NOW() - INTERVAL '24 hours')
+         WHERE br.expires_at > NOW() OR br.status = 'cleared'
          ORDER BY br.blocked_at DESC
-         LIMIT 200`,
+         LIMIT 100`,
       );
       res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -1139,9 +1127,9 @@ class DriverController {
                   a.immatriculation AS reported_by_ambulance
            FROM blocked_roads br
            LEFT JOIN ambulances a ON br.reported_by = a.id
-           WHERE br.status = 'active'
+           WHERE br.expires_at > NOW() OR br.status = 'cleared'
            ORDER BY br.blocked_at DESC
-           LIMIT 200`,
+           LIMIT 100`,
         );
         res.json({ success: true, data: fallback.rows });
       } catch {
