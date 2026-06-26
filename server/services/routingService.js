@@ -4,6 +4,29 @@
 // - NOUVEAU: getBasePathAvoidingBlocked — algo de base (dijkstra simple, sans
 //   facteur horaire/trafic) utilisé pour le trajet SOS->driver. Il évite
 //   uniquement les obstacles actifs, jamais de "fastest"/"comfort" sur ce segment.
+// FIX v5 (CE PATCH) — CAUSE RÉELLE DU BUG "fastest n'évite pas l'obstacle" :
+// Dans getPathAvoidingEdges, la sous-requête SQL passée à pgr_dijkstra
+// référençait `FROM ways WHERE source IS NOT NULL ${blockedClause}` — SANS
+// alias sur la table `ways`. Or `blockedClause` est construit comme
+// `AND w.gid NOT IN (...)`, qui suppose un alias `w`. Comme cet alias
+// n'existait pas dans cette sous-requête précise (contrairement à
+// getBasePathAvoidingBlocked et getComfortPath, qui écrivent bien
+// `FROM ways w`), la requête échouait dès qu'au moins un obstacle actif
+// existait (blockedClause non vide) avec une erreur Postgres du type
+// "missing FROM-clause entry for table w" ou "relation w does not exist".
+// Cette erreur était silencieusement absorbée par le bloc catch, qui
+// retombe sur getPathWithGeometry — une fonction qui ne tient JAMAIS compte
+// des obstacles. Résultat observé : le serveur renvoie bien un nouveau
+// tracé (donc le client le redessine, et le message "recalculé" apparaît
+// normalement), mais ce tracé traverse toujours la rue bloquée, puisqu'il
+// vient en réalité du fallback sans obstacle. C'est pour ça que ça
+// "marchait par hasard" tant qu'aucun obstacle n'était encore actif
+// (blockedClause vide → requête valide), et cassait dès qu'un obstacle
+// existait. getComfortPath et getBasePathAvoidingBlocked n'ont jamais eu ce
+// bug car leurs sous-requêtes écrivent bien `FROM ways w` avec l'alias.
+// FIX: ajout de l'alias `w` dans la sous-requête de getPathAvoidingEdges,
+// exactement comme dans les deux autres fonctions. Aucun autre changement
+// de comportement.
 
 import { pool } from "../config/database.js";
 
@@ -176,7 +199,7 @@ class RoutingService {
       try {
         const res = await pool.query(
           `SELECT edge_id FROM blocked_roads
-           WHERE status = 'active' AND expires_at > NOW()`,
+           WHERE status = 'active'`,
         );
         dbBlocked = res.rows.map((r) => parseInt(r.edge_id, 10));
       } catch {
@@ -228,6 +251,12 @@ class RoutingService {
 
   // ── FASTEST path: time-based, avoids blocked edges ───────────────────────
   // Utilisé UNIQUEMENT pour le segment SOS -> hôpital (driverController)
+  // FIX v5: la sous-requête utilise maintenant "FROM ways w" (alias présent)
+  // au lieu de "FROM ways" (sans alias) — c'était la cause réelle du bug:
+  // blockedClause référence "w.gid", qui n'existait pas tant que l'alias
+  // n'était pas déclaré, faisant échouer silencieusement la requête dès
+  // qu'un obstacle actif existait, et retomber sur getPathWithGeometry qui
+  // ignore totalement les obstacles.
   async getPathAvoidingEdges(
     startVertexId,
     endVertexId,
@@ -247,7 +276,7 @@ class RoutingService {
       try {
         const res = await pool.query(
           `SELECT edge_id FROM blocked_roads
-           WHERE status = 'active' AND expires_at > NOW()`,
+           WHERE status = 'active'`,
         );
         dbBlocked = res.rows.map((r) => parseInt(r.edge_id, 10));
       } catch {
@@ -263,6 +292,7 @@ class RoutingService {
       const now = new Date();
       const timeFactor = this.getTimeFactor(now.getHours(), now.getMinutes());
 
+      // FIX v5: "FROM ways w" — alias ajouté (était "FROM ways" avant ce patch)
       const query = `
         SELECT a.seq, a.node, a.edge, a.cost, a.agg_cost,
                ST_AsGeoJSON(
@@ -270,11 +300,11 @@ class RoutingService {
                       ELSE ST_Reverse(w.the_geom) END
                ) AS geometry
         FROM pgr_dijkstra(
-          'SELECT gid::bigint AS id, source::bigint, target::bigint,
-                  (ST_Length(the_geom::geography) / (COALESCE(maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS cost,
-                  (ST_Length(the_geom::geography) / (COALESCE(maxspeed_backward,maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS reverse_cost
-           FROM ways
-           WHERE source IS NOT NULL ${blockedClause}',
+          'SELECT w.gid::bigint AS id, w.source::bigint, w.target::bigint,
+                  (ST_Length(w.the_geom::geography) / (COALESCE(w.maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS cost,
+                  (ST_Length(w.the_geom::geography) / (COALESCE(w.maxspeed_backward,w.maxspeed_forward,40)*1000.0/3600.0)) * ${timeFactor} AS reverse_cost
+           FROM ways w
+           WHERE w.source IS NOT NULL ${blockedClause}',
           $1::bigint, $2::bigint, $3::boolean
         ) a
         JOIN ways w ON a.edge = w.gid
@@ -320,7 +350,7 @@ class RoutingService {
       let dbBlocked = [];
       try {
         const res = await pool.query(
-          `SELECT edge_id FROM blocked_roads WHERE status = 'active' AND expires_at > NOW()`,
+          `SELECT edge_id FROM blocked_roads WHERE status = 'active'`,
         );
         dbBlocked = res.rows.map((r) => parseInt(r.edge_id, 10));
       } catch {
