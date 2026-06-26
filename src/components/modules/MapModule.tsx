@@ -65,6 +65,14 @@ import {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || window.location.origin;
+const LIVE_INTERVENTION_STATUSES = [
+  "en route",
+  "en attente",
+  "transport",
+  "transporting",
+  "en_transport",
+  "en_route_hopital",
+];
 
 const makeSVGIcon = (emoji: string, bg: string, size = 36) =>
   "data:image/svg+xml;charset=utf-8," +
@@ -234,15 +242,13 @@ const MapModule: React.FC = () => {
   }, [ambulances]);
 
   const activeInterventions = interventions.filter((i) =>
-    ["en route", "en attente", "transport", "en_transport"].includes(i.statut),
+    LIVE_INTERVENTION_STATUSES.includes(i.statut),
   );
   const ambulancesEnMission = ambulances.filter((a) =>
     interventions.some(
       (i) =>
         i.ambulance_id === a.id &&
-        ["en route", "en attente", "transport", "en_transport"].includes(
-          i.statut,
-        ),
+        LIVE_INTERVENTION_STATUSES.includes(i.statut),
     ),
   );
 
@@ -603,9 +609,7 @@ const MapModule: React.FC = () => {
         const activeIntervention = interventions.find(
           (i) =>
             i.ambulance_id === ambulanceId &&
-            ["en route", "en attente", "transport", "en_transport"].includes(
-              i.statut,
-            ),
+            LIVE_INTERVENTION_STATUSES.includes(i.statut),
         );
         if (!activeIntervention) return null;
 
@@ -617,9 +621,12 @@ const MapModule: React.FC = () => {
         const ambulanceData = await ambulanceRes.json();
         if (!ambulanceData.success || !ambulanceData.data) return null;
 
-        const isTransport = ["transport", "en_transport"].includes(
-          activeIntervention.statut,
-        );
+        const isTransport = [
+          "transport",
+          "transporting",
+          "en_transport",
+          "en_route_hopital",
+        ].includes(activeIntervention.statut);
         const destinationType = isTransport
           ? "hospital"
           : ("intervention" as const);
@@ -639,8 +646,8 @@ const MapModule: React.FC = () => {
         const lastType =
           lastKnownRouteTypeRef.current[ambulanceId] || "fastest";
         const endpoint = isTransport
-          ? `${API_BASE_URL}/mobile/driver/route-to-hospital/${activeIntervention.id}?routeType=${lastType}`
-          : `${API_BASE_URL}/mobile/driver/route/${activeIntervention.id}`;
+          ? `${API_BASE_URL}/mobile/manager/route-to-hospital/${activeIntervention.id}?routeType=${lastType}`
+          : `${API_BASE_URL}/mobile/manager/route/${activeIntervention.id}`;
 
         let routeCoords: [number, number][] = [];
         let destinationLat: number | null = null;
@@ -796,9 +803,7 @@ const MapModule: React.FC = () => {
         interventions.some(
           (i) =>
             i.ambulance_id === a.id &&
-            ["en route", "en attente", "transport", "en_transport"].includes(
-              i.statut,
-            ),
+            LIVE_INTERVENTION_STATUSES.includes(i.statut),
         ),
       )
       .map((a) => a.id);

@@ -416,16 +416,22 @@ class DriverController {
   async getRoute(req, res) {
     try {
       const { interventionId } = req.params;
-      const ambulanceId = req.user.ambulanceId;
 
       const intervention = await pool.query(
-        "SELECT latitude_depart, longitude_depart FROM interventions WHERE id=$1",
+        "SELECT ambulance_id, latitude_depart, longitude_depart FROM interventions WHERE id=$1",
         [interventionId],
       );
       if (!intervention.rows.length)
         return res
           .status(404)
           .json({ success: false, error: "Intervention not found" });
+
+      const ambulanceId = req.user.ambulanceId || intervention.rows[0].ambulance_id;
+      if (!ambulanceId)
+        return res.status(400).json({
+          success: false,
+          error: "No ambulance assigned to this intervention",
+        });
 
       const ambulance = await pool.query(
         "SELECT latitude, longitude FROM ambulances WHERE id=$1",
@@ -505,10 +511,10 @@ class DriverController {
     try {
       const { interventionId } = req.params;
       const { routeType = "fastest" } = req.query;
-      const ambulanceId = req.user.ambulanceId;
 
       const intervention = await pool.query(
-        `SELECT i.id, i.latitude_depart, i.longitude_depart, i.hospital_id, i.statut,
+        `SELECT i.id, i.ambulance_id, i.latitude_depart, i.longitude_depart,
+                i.hospital_id, i.statut,
                 h.id AS hosp_id, h.nom AS hospital_name,
                 h.latitude AS hospital_lat, h.longitude AS hospital_lon
          FROM interventions i
@@ -523,6 +529,12 @@ class DriverController {
           .json({ success: false, error: "Intervention not found" });
 
       const data = intervention.rows[0];
+      const ambulanceId = req.user.ambulanceId || data.ambulance_id;
+      if (!ambulanceId)
+        return res.status(400).json({
+          success: false,
+          error: "No ambulance assigned to this intervention",
+        });
 
       if (!data.hospital_id)
         return res

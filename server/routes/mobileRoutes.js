@@ -25,6 +25,24 @@ router.get(
   driverController.getRoadblocks,
 );
 
+router.get(
+  "/manager/route/:interventionId",
+  verifyToken,
+  requireRole(["manager"]),
+  validateId,
+  checkValidation,
+  driverController.getRoute,
+);
+
+router.get(
+  "/manager/route-to-hospital/:interventionId",
+  verifyToken,
+  requireRole(["manager"]),
+  validateId,
+  checkValidation,
+  driverController.getRouteToHospital,
+);
+
 // Clear (delete) a roadblock — manager only
 router.delete(
   "/manager/roadblock/:edge_id",
